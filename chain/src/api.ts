@@ -249,12 +249,42 @@ export const createWalletAndMidnightProvider = async (
   };
 };
 
+// isSynced = shielded && dust && unshielded streams each report
+// isConnected + appliedIndex caught up to highestRelevantWalletIndex.
+// Log each stream so a dead subscription is visible instead of an
+// endless "Synced: false".
+const describeProgress = (p: unknown): string => {
+  if (!p || typeof p !== "object") return "n/a";
+  const d = p as {
+    isConnected?: boolean;
+    appliedIndex?: bigint;
+    highestRelevantWalletIndex?: bigint;
+    // unshielded progress uses transaction ids instead of event indices
+    appliedId?: bigint;
+    highestTransactionId?: bigint;
+  };
+  const applied = d.appliedIndex ?? d.appliedId;
+  const highest = d.highestRelevantWalletIndex ?? d.highestTransactionId;
+  return `conn=${d.isConnected} applied=${applied}/${highest}`;
+};
+
 export const waitForSync = (wallet: WalletFacade) =>
   Rx.firstValueFrom(
     wallet.state().pipe(
       Rx.throttleTime(5_000),
       Rx.tap((state) => {
-        logger.info(`Waiting for wallet sync. Synced: ${state.isSynced}`);
+        const s = state as unknown as {
+          shielded?: { state?: { progress?: unknown } };
+          dust?: { state?: { progress?: unknown } };
+          unshielded?: { progress?: unknown };
+        };
+        logger.info(
+          `Waiting for wallet sync. Synced: ${state.isSynced} | shielded ${describeProgress(
+            s.shielded?.state?.progress,
+          )} | dust ${describeProgress(
+            s.dust?.state?.progress,
+          )} | unshielded ${describeProgress(s.unshielded?.progress)}`,
+        );
       }),
       Rx.filter((state) => state.isSynced),
     ),
@@ -381,12 +411,18 @@ export const initWalletWithSeed = async (
   );
 
   const relayURL = new URL(config.node.replace(/^http/, "ws"));
+  // First sync scans the full chain history (~1.3M indexer events on
+  // preprod). Default batching (size 10, 4ms spacing) throttles the dust
+  // stream to ~50 events/s, which is hours; larger batches with no
+  // spacing bring it to a usable rate.
+  const batchUpdates = { size: 1000, timeout: 25, spacing: 0 };
   const shieldedConfig = {
     networkId: config.networkId,
     indexerClientConnection: {
       indexerHttpUrl: config.indexer,
       indexerWsUrl: config.indexerWS,
     },
+    batchUpdates,
     provingServerUrl: new URL(config.proofServer),
     relayURL,
     txHistoryStorage: new InMemoryTransactionHistoryStorage(WalletEntrySchema),
@@ -405,6 +441,7 @@ export const initWalletWithSeed = async (
       additionalFeeOverhead: 300_000_000_000_000n,
       feeBlocksMargin: 5,
     },
+    batchUpdates,
     indexerClientConnection: {
       indexerHttpUrl: config.indexer,
       indexerWsUrl: config.indexerWS,

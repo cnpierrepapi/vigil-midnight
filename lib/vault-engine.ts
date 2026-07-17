@@ -276,6 +276,76 @@ function ledgerOf(env: Loaded, point: ChainPoint): WireLedger {
   return serializeLedger(env.mod, env.mod.ledger(point.state as any));
 }
 
+// ---------- live testnet read (indexer -> real deserialized ledger) ----------
+
+// Same query the midnight-js indexer provider runs; a plain fetch keeps
+// Apollo and its dependency tail out of the serverless bundle.
+const INDEXER_URL =
+  process.env.MIDNIGHT_INDEXER_URL ??
+  "https://indexer.preprod.midnight.network/api/v4/graphql";
+
+const CONTRACT_STATE_QUERY = `query CONTRACT_STATE_QUERY($address: HexEncoded!, $offset: ContractActionOffset) {
+  contractAction(address: $address, offset: $offset) { state }
+}`;
+
+export type ChainLedgerResponse = {
+  ok: boolean;
+  error?: string;
+  network: "preprod";
+  contractAddress: string | null;
+  ledger: WireLedger | null;
+  fetchedAt: number;
+};
+
+function hexToBytesVar(hex: string): Uint8Array {
+  const clean = hex.length % 2 === 0 ? hex : "0" + hex;
+  const bytes = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+  }
+  return bytes;
+}
+
+export async function fetchChainLedger(): Promise<ChainLedgerResponse> {
+  const contractAddress = process.env.VIGIL_CONTRACT_ADDRESS ?? null;
+  const fetchedAt = Math.floor(Date.now() / 1000);
+  const fail = (error: string): ChainLedgerResponse => ({
+    ok: false,
+    error,
+    network: "preprod",
+    contractAddress,
+    ledger: null,
+    fetchedAt,
+  });
+
+  if (!contractAddress) return fail("Not deployed yet: VIGIL_CONTRACT_ADDRESS is not configured");
+  try {
+    const env = await load();
+    const res = await fetch(INDEXER_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        query: CONTRACT_STATE_QUERY,
+        variables: { address: contractAddress, offset: null },
+      }),
+      cache: "no-store",
+    });
+    if (!res.ok) return fail(`Indexer HTTP ${res.status}`);
+    const body = (await res.json()) as {
+      data?: { contractAction?: { state?: string } | null };
+      errors?: Array<{ message: string }>;
+    };
+    if (body.errors?.length) return fail(body.errors[0].message);
+    const stateHex = body.data?.contractAction?.state;
+    if (!stateHex) return fail("Contract not found on the preprod indexer");
+    const contractState = env.rt.ContractState.deserialize(hexToBytesVar(stateHex));
+    const ledger = serializeLedger(env.mod, env.mod.ledger(contractState.data));
+    return { ok: true, network: "preprod", contractAddress, ledger, fetchedAt };
+  } catch (e) {
+    return fail(e instanceof Error ? e.message : String(e));
+  }
+}
+
 // ---------- public API ----------
 
 export async function handleAction(

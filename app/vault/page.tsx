@@ -34,6 +34,15 @@ type VaultResponse = {
   serverTime: number;
 };
 
+type ChainLedgerResponse = {
+  ok: boolean;
+  error?: string;
+  network: "preprod";
+  contractAddress: string | null;
+  ledger: WireLedger | null;
+  fetchedAt: number;
+};
+
 // ---------- helpers ----------
 
 const ZERO64 = "0".repeat(64);
@@ -78,6 +87,26 @@ export default function VaultPage() {
   // owner secrets live only in this browser
   const [ownerSecrets, setOwnerSecrets] = useState<WireSecrets | null>(null);
   const [heirSecret, setHeirSecret] = useState<string>("");
+
+  // live on-chain state of the deployed preprod contract (read-only)
+  const [chain, setChain] = useState<ChainLedgerResponse | null>(null);
+  const [chainBusy, setChainBusy] = useState(false);
+
+  const refreshChain = useCallback(async () => {
+    setChainBusy(true);
+    try {
+      const res = await fetch("/api/chain", { cache: "no-store" });
+      setChain((await res.json()) as ChainLedgerResponse);
+    } catch {
+      setChain(null);
+    } finally {
+      setChainBusy(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshChain();
+  }, [refreshChain]);
 
   // form state
   const [windowSec, setWindowSec] = useState("90");
@@ -559,6 +588,84 @@ export default function VaultPage() {
           </tbody>
         </table>
       </section>
+
+      {chain && chain.ok && chain.ledger && (
+        <section className="ledger">
+          <h2>Live on Midnight Preprod</h2>
+          <p className="note">
+            The same contract, deployed for real. This is the public ledger
+            of VIGIL at{" "}
+            <code className="inline" title={chain.contractAddress ?? ""}>
+              {shortHash(chain.contractAddress ?? "")}
+            </code>{" "}
+            on the Midnight Preprod testnet, read from the network indexer
+            and deserialized through the contract runtime.{" "}
+            <button
+              className="cta ghost small"
+              onClick={refreshChain}
+              disabled={chainBusy}
+            >
+              {chainBusy ? "Reading chain…" : "Refresh"}
+            </button>
+          </p>
+          <table>
+            <tbody>
+              <tr>
+                <td className="k">state</td>
+                <td className="v">{chain.ledger.state}</td>
+              </tr>
+              <tr>
+                <td className="k">ownerCommit</td>
+                <td className="v" title={chain.ledger.ownerCommit}>
+                  {shortHash(chain.ledger.ownerCommit)}
+                </td>
+              </tr>
+              <tr>
+                <td className="k">heirCommit</td>
+                <td className="v" title={chain.ledger.heirCommit}>
+                  {shortHash(chain.ledger.heirCommit)}
+                </td>
+              </tr>
+              <tr>
+                <td className="k">balanceCommit</td>
+                <td className="v" title={chain.ledger.balanceCommit}>
+                  {shortHash(chain.ledger.balanceCommit)}
+                </td>
+              </tr>
+              <tr>
+                <td className="k">lastPulse</td>
+                <td className="v">{chain.ledger.lastPulse}</td>
+              </tr>
+              <tr>
+                <td className="k">vigilWindow</td>
+                <td className="v">{chain.ledger.vigilWindow}</td>
+              </tr>
+              <tr>
+                <td className="k">pulses</td>
+                <td className="v">{chain.ledger.pulses}</td>
+              </tr>
+              <tr>
+                <td className="k">attestedFloor</td>
+                <td className="v">{chain.ledger.attestedFloor}</td>
+              </tr>
+              <tr>
+                <td className="k">legacyNote</td>
+                <td className="v">
+                  {chain.ledger.legacyNotePresent
+                    ? "opaque blob (present, unreadable)"
+                    : "(none)"}
+                </td>
+              </tr>
+              <tr>
+                <td className="k">claimReceipt</td>
+                <td className="v" title={chain.ledger.claimReceipt}>
+                  {shortHash(chain.ledger.claimReceipt)}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+      )}
 
       <footer className="footer">
         Every action on this page executes a real compiled Compact circuit
