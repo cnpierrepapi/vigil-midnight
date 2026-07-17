@@ -181,9 +181,18 @@ export default function VaultPage() {
       const raw = e instanceof Error ? e.message : "Wallet declined the connection";
       // "Remote API ... was shutdown" is the Lace extension's background
       // worker going idle mid-handshake, not a DApp-side failure
-      const message = /shutdown|no longer be used/i.test(raw)
-        ? "Lace's background process was asleep. Open the Lace extension, unlock it, then press Connect again."
-        : raw;
+      let message = raw;
+      // "Remote API ... was shutdown" is the Lace extension's background
+      // worker going idle mid-handshake, not a DApp-side failure
+      if (/shutdown|no longer be used/i.test(raw)) {
+        message =
+          "Lace's background process was asleep. Open the Lace extension, unlock it, then press Connect again.";
+      } else if (/network id mismatch/i.test(raw)) {
+        // VIGIL lives on the preprod testnet; Lace ships pointed at the
+        // preview testnet by default
+        message =
+          "Your wallet is on a different Midnight network (addresses starting mn_addr_preview belong to the Preview testnet). VIGIL is deployed on Preprod: in Lace, open Settings, choose Network, select Pre-production, then press Connect again.";
+      }
       setWallet({ status: "error", message });
     }
   }, []);
