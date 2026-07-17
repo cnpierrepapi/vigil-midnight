@@ -8,28 +8,83 @@
 // actual circuit with its original timestamp, so the ledger state returned
 // is always derived from real circuit execution, never faked.
 //
+// Module loading: the contract runtime wraps a WASM module whose classes
+// break if two copies load (instanceof checks fail across instances), so
+// BOTH the runtime and the compiled contract are loaded with webpackIgnore
+// dynamic imports. Node's own ESM loader resolves everything from disk and
+// its module cache guarantees a single WASM instance. Types come from
+// erased type-only imports; no runtime value crosses the bundler boundary.
+//
 // Demo topology caveat (also shown in the UI): witnesses travel to this
 // server. In production the proof server runs on the user's own machine.
 
-import {
-  Contract,
-  ledger,
-  pureCircuits,
-  VaultState,
-  type Ledger,
-} from "../contract/src/managed/vigil/contract/index.js";
-import {
-  witnesses,
-  type VigilPrivateState,
-} from "../contract/src/witnesses";
-import {
-  createConstructorContext,
-  createCircuitContext,
-  sampleContractAddress,
-} from "@midnight-ntwrk/compact-runtime";
+import { pathToFileURL } from "node:url";
+import path from "node:path";
+
+type ContractModule = typeof import("../contract/src/managed/vigil/contract/index.js");
+type Runtime = typeof import("@midnight-ntwrk/compact-runtime");
+type Ledger = import("../contract/src/managed/vigil/contract/index.js").Ledger;
+
+// Each party's DApp instance holds only the secrets it should hold; fields
+// a role does not possess stay zeroed (same shape the test suite uses).
+type VigilPrivateState = {
+  readonly ownerSecretKey: Uint8Array;
+  readonly heirSecret: Uint8Array;
+  readonly balance: bigint;
+  readonly balanceSalt: Uint8Array;
+};
+
+const witnesses = {
+  ownerSecretKey: ({ privateState }: { privateState: VigilPrivateState }): [VigilPrivateState, Uint8Array] =>
+    [privateState, privateState.ownerSecretKey],
+  heirSecret: ({ privateState }: { privateState: VigilPrivateState }): [VigilPrivateState, Uint8Array] =>
+    [privateState, privateState.heirSecret],
+  vaultBalance: ({ privateState }: { privateState: VigilPrivateState }): [VigilPrivateState, bigint] =>
+    [privateState, privateState.balance],
+  balanceSalt: ({ privateState }: { privateState: VigilPrivateState }): [VigilPrivateState, Uint8Array] =>
+    [privateState, privateState.balanceSalt],
+};
 
 const COIN_PUBLIC_KEY =
   "0000000000000000000000000000000000000000000000000000000000000000";
+
+// ---------- native module loading (bypasses the bundler entirely) ----------
+
+type Loaded = {
+  rt: Runtime;
+  mod: ContractModule;
+  contract: import("../contract/src/managed/vigil/contract/index.js").Contract<VigilPrivateState>;
+};
+
+let loaded: Promise<Loaded> | null = null;
+
+function load(): Promise<Loaded> {
+  loaded ??= (async () => {
+    const contractUrl = pathToFileURL(
+      path.join(
+        process.cwd(),
+        "contract",
+        "src",
+        "managed",
+        "vigil",
+        "contract",
+        "index.js",
+      ),
+    ).href;
+    const mod = (await import(
+      /* webpackIgnore: true */ contractUrl
+    )) as ContractModule;
+    // a native (webpackIgnore) bare-specifier import resolves from disk to
+    // the same root node_modules copy the contract module itself loads, so
+    // Node's ESM cache returns one shared WASM instance to both of us
+    const rt = (await import(
+      /* webpackIgnore: true */ "@midnight-ntwrk/compact-runtime"
+    )) as Runtime;
+    const contract = new mod.Contract<VigilPrivateState>(witnesses);
+    return { rt, mod, contract };
+  })();
+  return loaded;
+}
 
 // ---------- wire formats (JSON-safe) ----------
 
@@ -113,15 +168,15 @@ function decodeSecrets(w: WireSecrets): VigilPrivateState {
   };
 }
 
-function stateName(s: VaultState): WireLedger["state"] {
-  if (s === VaultState.ARMED) return "ARMED";
-  if (s === VaultState.CLAIMED) return "CLAIMED";
-  return "UNARMED";
-}
-
-function serializeLedger(l: Ledger): WireLedger {
+function serializeLedger(mod: ContractModule, l: Ledger): WireLedger {
+  const name =
+    l.state === mod.VaultState.ARMED
+      ? "ARMED"
+      : l.state === mod.VaultState.CLAIMED
+        ? "CLAIMED"
+        : "UNARMED";
   return {
-    state: stateName(l.state),
+    state: name,
     ownerCommit: toHex(l.ownerCommit),
     heirCommit: toHex(l.heirCommit),
     balanceCommit: toHex(l.balanceCommit),
@@ -136,8 +191,6 @@ function serializeLedger(l: Ledger): WireLedger {
 
 // ---------- replay ----------
 
-const contract = new Contract<VigilPrivateState>(witnesses);
-
 const ZERO_SECRETS: WireSecrets = {
   ownerSecretKey: "0".repeat(64),
   heirSecret: "0".repeat(64),
@@ -146,13 +199,15 @@ const ZERO_SECRETS: WireSecrets = {
 };
 
 type ChainPoint = {
-  addr: ReturnType<typeof sampleContractAddress>;
-  zswap: unknown;
   state: unknown;
   lastResult?: unknown;
 };
 
-function callCircuit(entry: JournalEntry, ctx: any) {
+function callCircuit(
+  { contract }: Loaded,
+  entry: JournalEntry,
+  ctx: any,
+) {
   const a = entry.args;
   switch (entry.circuit) {
     case "arm":
@@ -178,17 +233,29 @@ function callCircuit(entry: JournalEntry, ctx: any) {
   }
 }
 
-function replay(journal: JournalEntry[]): ChainPoint {
-  const addr = sampleContractAddress();
+function replay(env: Loaded, journal: JournalEntry[]): ChainPoint {
+  const { rt, contract } = env;
+  const addr = rt.sampleContractAddress();
   const initial = contract.initialState(
-    createConstructorContext(decodeSecrets(ZERO_SECRETS), COIN_PUBLIC_KEY),
+    rt.createConstructorContext(decodeSecrets(ZERO_SECRETS), COIN_PUBLIC_KEY),
   );
   let zswap: unknown = initial.currentZswapLocalState;
-  let state: unknown = initial.currentContractState;
+  // normalize ContractState -> query-context state (what ledger() reads),
+  // same as the test harness, which never reads ContractState directly
+  const ctx0 = rt.createCircuitContext(
+    addr,
+    initial.currentZswapLocalState,
+    initial.currentContractState,
+    decodeSecrets(ZERO_SECRETS),
+    undefined,
+    undefined,
+    0,
+  );
+  let state: unknown = ctx0.currentQueryContext.state;
   let lastResult: unknown;
 
   for (const entry of journal) {
-    const ctx = createCircuitContext(
+    const ctx = rt.createCircuitContext(
       addr,
       zswap as any,
       state as any,
@@ -197,36 +264,33 @@ function replay(journal: JournalEntry[]): ChainPoint {
       undefined,
       entry.time,
     );
-    const r = callCircuit(entry, ctx)!;
+    const r = callCircuit(env, entry, ctx)!;
     zswap = r.context.currentZswapLocalState;
     state = r.context.currentQueryContext.state;
     lastResult = r.result;
   }
-  return { addr, zswap, state, lastResult };
+  return { state, lastResult };
 }
 
-function ledgerOf(point: ChainPoint): WireLedger {
-  return serializeLedger(ledger(point.state as any));
+function ledgerOf(env: Loaded, point: ChainPoint): WireLedger {
+  return serializeLedger(env.mod, env.mod.ledger(point.state as any));
 }
 
 // ---------- public API ----------
 
-export function heirCommitmentOf(heirSecretHex: string): string {
-  return toHex(pureCircuits.heirPk(fromHex(heirSecretHex)));
-}
-
-export function handleAction(
+export async function handleAction(
   journal: JournalEntry[],
   action: VaultAction,
-): VaultResponse {
+): Promise<VaultResponse> {
+  const env = await load();
   const now = Math.floor(Date.now() / 1000);
 
   if (action.kind === "inspect") {
-    const point = replay(journal);
+    const point = replay(env, journal);
     return {
       ok: true,
       journal,
-      ledger: ledgerOf(point),
+      ledger: ledgerOf(env, point),
       serverTime: now,
     };
   }
@@ -241,7 +305,9 @@ export function handleAction(
         circuit: "arm",
         time: now,
         args: {
-          heirCommitment: heirCommitmentOf(action.secrets.heirSecret),
+          heirCommitment: toHex(
+            env.mod.pureCircuits.heirPk(fromHex(action.secrets.heirSecret)),
+          ),
           window: String(action.window),
           now: String(now),
           note: action.note,
@@ -285,11 +351,11 @@ export function handleAction(
 
   const next = [...journal, entry];
   try {
-    const point = replay(next);
+    const point = replay(env, next);
     return {
       ok: true,
       journal: next,
-      ledger: ledgerOf(point),
+      ledger: ledgerOf(env, point),
       result:
         action.kind === "claim" && typeof point.lastResult === "string"
           ? point.lastResult
@@ -300,7 +366,7 @@ export function handleAction(
     // the failed action is NOT appended; return the untouched chain state
     let ledgerState: WireLedger | null = null;
     try {
-      ledgerState = ledgerOf(replay(journal));
+      ledgerState = ledgerOf(env, replay(env, journal));
     } catch {
       ledgerState = null;
     }

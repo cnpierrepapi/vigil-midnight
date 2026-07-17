@@ -28,7 +28,7 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    const response = handleAction(journal, action);
+    const response = await handleAction(journal, action);
     return NextResponse.json(response);
   } catch (e) {
     return NextResponse.json(
