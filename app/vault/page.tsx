@@ -100,7 +100,13 @@ type WalletConn =
   | { status: "no-wallet" }
   | { status: "ready"; name: string }
   | { status: "connecting" }
-  | { status: "connected"; name: string; address: string; proverServerUri?: string }
+  | {
+      status: "connected";
+      name: string;
+      address: string;
+      network: string;
+      proverServerUri?: string;
+    }
   | { status: "error"; message: string };
 
 function findConnectorWallet(): { name: string; api: ConnectorInitialAPI } | null {
@@ -168,13 +174,26 @@ export default function VaultPage() {
     }
     setWallet({ status: "connecting" });
     try {
-      const api = await found.api.connect("preprod");
+      // VIGIL's vault lives on preprod, but current Lace builds only speak
+      // the preview testnet for Midnight; fall back to the wallet's own
+      // network so the connection succeeds, and label it honestly.
+      let network = "preprod";
+      let api: ConnectorConnectedAPI;
+      try {
+        api = await found.api.connect("preprod");
+      } catch (first) {
+        const msg = first instanceof Error ? first.message : String(first);
+        if (!/network id mismatch/i.test(msg)) throw first;
+        network = "preview";
+        api = await found.api.connect("preview");
+      }
       const [address] = await api.getShieldedAddresses();
       const config = await api.getConfiguration();
       setWallet({
         status: "connected",
         name: found.name,
         address: address ?? "(no address)",
+        network,
         proverServerUri: config.proverServerUri,
       });
     } catch (e) {
@@ -472,12 +491,15 @@ export default function VaultPage() {
         )}
         {wallet.status === "connected" && (
           <span className="wallet-note">
-            <strong>{wallet.name}</strong> connected:{" "}
+            <strong>{wallet.name}</strong> connected on {wallet.network}:{" "}
             <code className="inline" title={wallet.address}>
               {wallet.address.length > 24
                 ? `${wallet.address.slice(0, 14)}…${wallet.address.slice(-8)}`
                 : wallet.address}
             </code>
+            {wallet.network === "preview"
+              ? " · note: the live vault below runs on preprod, so this wallet observes but cannot transact with it"
+              : ""}
             {wallet.proverServerUri
               ? " · proving locally via your own proof server"
               : ""}
