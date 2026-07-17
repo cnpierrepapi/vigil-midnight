@@ -178,11 +178,13 @@ export default function VaultPage() {
         proverServerUri: config.proverServerUri,
       });
     } catch (e) {
-      setWallet({
-        status: "error",
-        message:
-          e instanceof Error ? e.message : "Wallet declined the connection",
-      });
+      const raw = e instanceof Error ? e.message : "Wallet declined the connection";
+      // "Remote API ... was shutdown" is the Lace extension's background
+      // worker going idle mid-handshake, not a DApp-side failure
+      const message = /shutdown|no longer be used/i.test(raw)
+        ? "Lace's background process was asleep. Open the Lace extension, unlock it, then press Connect again."
+        : raw;
+      setWallet({ status: "error", message });
     }
   }, []);
 
