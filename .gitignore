@@ -3,6 +3,10 @@ dist/
 .next/
 .vercel/
 *.log
+chain/deployment.json
+chain/vault-secrets.json
+chain/*.db
+chain/midnight-level-db/
 .env
 .env.*
 .DS_Store
