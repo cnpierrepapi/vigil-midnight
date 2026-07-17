@@ -1,0 +1,111 @@
+pragma language_version 0.23;
+
+import CompactStandardLibrary;
+
+// VIGIL: a zero-knowledge dead man's switch.
+// The vault is a state machine: UNARMED -> ARMED -> CLAIMED.
+export enum VaultState {
+  UNARMED,
+  ARMED,
+  CLAIMED
+}
+
+// Everything the chain sees. Identities and the balance are commitments
+// (hashes); the only plaintext facts are the window, the pulse clock,
+// and whatever the owner chooses to attest via proveFunded.
+export ledger state: VaultState;
+export ledger ownerCommit: Bytes<32>;
+export ledger heirCommit: Bytes<32>;
+export ledger balanceCommit: Bytes<32>;
+export ledger lastPulse: Uint<64>;
+export ledger vigilWindow: Uint<64>;
+export ledger pulses: Counter;
+export ledger attestedFloor: Uint<64>;
+export ledger legacyNote: Maybe<Opaque<'string'>>;
+export ledger claimReceipt: Bytes<32>;
+
+constructor() {
+  state = VaultState.UNARMED;
+  legacyNote = none<Opaque<'string'>>();
+}
+
+// Private inputs. Each role's DApp instance holds only its own secrets;
+// fields a role does not possess stay zeroed on that instance.
+witness ownerSecretKey(): Bytes<32>;
+witness heirSecret(): Bytes<32>;
+witness vaultBalance(): Uint<64>;
+witness balanceSalt(): Bytes<32>;
+
+// Domain-separated commitments: a hash from one domain can never be
+// replayed as a preimage claim in another.
+export pure circuit ownerPk(sk: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "vigil:owner:"), sk]);
+}
+
+export pure circuit heirPk(secret: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "vigil:heir:"), secret]);
+}
+
+export pure circuit balanceCommitment(amount: Uint<64>, salt: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "vigil:balance:"), salt, amount as Field as Bytes<32>]);
+}
+
+// Seal the vault: owner/heir/balance become commitments, the vigil starts.
+// blockTimeGte(now) proves now <= on-chain block time, so the first pulse
+// cannot be post-dated to buy extra time.
+export circuit arm(heirCommitment: Bytes<32>, window: Uint<64>, now: Uint<64>, note: Opaque<'string'>): [] {
+  assert(state == VaultState.UNARMED, "Vault is already armed");
+  assert(blockTimeGte(disclose(now)), "Pulse is timestamped in the future");
+  ownerCommit = disclose(ownerPk(ownerSecretKey()));
+  heirCommit = disclose(heirCommitment);
+  balanceCommit = disclose(balanceCommitment(vaultBalance(), balanceSalt()));
+  vigilWindow = disclose(window);
+  lastPulse = disclose(now);
+  legacyNote = disclose(some<Opaque<'string'>>(note));
+  pulses.increment(1);
+  state = VaultState.ARMED;
+}
+
+// The ZK heartbeat: proves knowledge of the owner key, reveals nothing
+// about who the owner is. Resets the lapse clock.
+export circuit keepVigil(now: Uint<64>): [] {
+  assert(state == VaultState.ARMED, "Vault is not armed");
+  assert(ownerCommit == ownerPk(ownerSecretKey()), "Not the vault owner");
+  assert(blockTimeGte(disclose(now)), "Pulse is timestamped in the future");
+  assert(now >= lastPulse, "Pulse is older than the last one");
+  lastPulse = disclose(now);
+  pulses.increment(1);
+}
+
+// Roll the private balance commitment forward. The amount deposited and
+// the running total both stay private; only the commitment changes.
+export circuit deposit(amount: Uint<64>, newSalt: Bytes<32>): [] {
+  assert(state == VaultState.ARMED, "Vault is not armed");
+  assert(ownerCommit == ownerPk(ownerSecretKey()), "Not the vault owner");
+  assert(balanceCommit == balanceCommitment(vaultBalance(), balanceSalt()), "Private balance does not match the on-chain commitment");
+  balanceCommit = disclose(balanceCommitment((vaultBalance() + amount) as Uint<64>, newSalt));
+}
+
+// Selective disclosure: publicly attest "balance >= threshold" while the
+// actual amount stays private. The floor is the only number revealed.
+export circuit proveFunded(threshold: Uint<64>): [] {
+  assert(state == VaultState.ARMED, "Vault is not armed");
+  assert(ownerCommit == ownerPk(ownerSecretKey()), "Not the vault owner");
+  assert(balanceCommit == balanceCommitment(vaultBalance(), balanceSalt()), "Private balance does not match the on-chain commitment");
+  assert(vaultBalance() >= threshold, "Vault balance is below the attested floor");
+  attestedFloor = disclose(threshold);
+}
+
+// The heir's moment. Passes only when the protocol itself confirms the
+// vigil lapsed (kernel block time > lastPulse + vigilWindow) AND the
+// caller proves knowledge of the heir secret. Emits a claim receipt and
+// releases the legacy note.
+export circuit claim(): Opaque<'string'> {
+  assert(state == VaultState.ARMED, "Vault is not armed");
+  assert(blockTimeGt((lastPulse + vigilWindow) as Uint<64>), "The vigil holds; the owner is still with us");
+  assert(heirCommit == heirPk(heirSecret()), "Not the designated heir");
+  const note = legacyNote.value;
+  claimReceipt = disclose(persistentHash<Vector<2, Bytes<32>>>([pad(32, "vigil:claimed:"), heirSecret()]));
+  state = VaultState.CLAIMED;
+  return note;
+}

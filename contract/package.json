@@ -1,0 +1,30 @@
+{
+  "name": "vigil-contract",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "compact": "compact compile src/vigil.compact src/managed/vigil",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "tsc --project tsconfig.build.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@midnight-ntwrk/compact-runtime": "^0.16.0"
+  },
+  "devDependencies": {
+    "@midnight-ntwrk/midnight-js-network-id": "^2.0.2",
+    "typescript": "^5.9.3",
+    "vitest": "^3.0.0"
+  }
+}
