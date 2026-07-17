@@ -4,6 +4,7 @@
 // wallet-sdk 1.1.0 barrel).
 
 import "dotenv/config";
+import fs from "node:fs";
 import { type ContractAddress } from "@midnight-ntwrk/midnight-js-protocol/compact-runtime";
 import * as ledger from "@midnight-ntwrk/midnight-js-protocol/ledger";
 import { CompiledContract } from "@midnight-ntwrk/midnight-js-protocol/compact-js";
@@ -382,9 +383,81 @@ export const mnemonicToSeed = async (mnemonic: string): Promise<Buffer> => {
   return Buffer.from(seed);
 };
 
+// ---------- wallet state snapshots (first sync survives restarts) ----------
+
+type WalletSnapshot = {
+  shielded: string;
+  unshielded: string;
+  dust: string;
+  savedAt: string;
+};
+
+const readWalletSnapshot = (file: string): WalletSnapshot | null => {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as WalletSnapshot;
+    if (parsed.shielded && parsed.unshielded && parsed.dust) return parsed;
+    return null;
+  } catch {
+    return null;
+  }
+};
+
+const writeWalletSnapshot = (file: string, snap: WalletSnapshot): void => {
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(snap));
+  fs.renameSync(tmp, file);
+};
+
+// Serializes all three wallet states every 30s. The indexer pushes the
+// full event history with no backpressure while the dust stream applies
+// it slowly, so the process trends toward heap exhaustion and GC thrash;
+// when heap use crosses the threshold this saves one last snapshot and
+// exits 42 so a wrapper can relaunch with a fresh heap, resuming from
+// the snapshot instead of genesis.
+export const startSnapshotLoop = (
+  facade: WalletFacade,
+  file: string,
+): (() => void) => {
+  const HEAP_LIMIT = 3 * 1024 * 1024 * 1024;
+  let busy = false;
+  const timer = setInterval(async () => {
+    if (busy) return;
+    busy = true;
+    try {
+      const snap: WalletSnapshot = {
+        shielded: await facade.shielded.serializeState(),
+        unshielded: await facade.unshielded.serializeState(),
+        dust: await facade.dust.serializeState(),
+        savedAt: new Date().toISOString(),
+      };
+      writeWalletSnapshot(file, snap);
+      const heap = process.memoryUsage().heapUsed;
+      if (heap > HEAP_LIMIT) {
+        // never restart after sync completes: a restart mid-deploy could
+        // submit the deploy transaction twice
+        const state = await Rx.firstValueFrom(facade.state());
+        if (!state.isSynced) {
+          logger.warn(
+            `Heap at ${(heap / 1e9).toFixed(2)}GB; snapshot saved, exiting 42 for a fresh-heap restart`,
+          );
+          process.exit(42);
+        }
+      }
+    } catch (e) {
+      logger.warn(
+        `Snapshot failed (sync continues): ${e instanceof Error ? e.message : String(e)}`,
+      );
+    } finally {
+      busy = false;
+    }
+  }, 30_000);
+  return () => clearInterval(timer);
+};
+
 export const initWalletWithSeed = async (
   seed: Buffer,
   config: Config,
+  snapshotPath?: string,
 ): Promise<WalletContext> => {
   const hdWallet = HDWallet.fromSeed(seed);
   if (hdWallet.type !== "seedOk") {
@@ -413,9 +486,12 @@ export const initWalletWithSeed = async (
   const relayURL = new URL(config.node.replace(/^http/, "ws"));
   // First sync scans the full chain history (~1.3M indexer events on
   // preprod). Default batching (size 10, 4ms spacing) throttles the dust
-  // stream to ~50 events/s, which is hours; larger batches with no
-  // spacing bring it to a usable rate.
-  const batchUpdates = { size: 1000, timeout: 25, spacing: 0 };
+  // stream; no spacing removes the idle time. Batch size stays moderate:
+  // each batch is applied synchronously in WASM, and multi-second blocks
+  // starve the event loop until the polkadot RPC layer times out.
+  // spacing 1ms = one macro-task yield per batch so timers and sockets
+  // stay serviced during the scan; throughput cost is negligible.
+  const batchUpdates = { size: 100, timeout: 25, spacing: 1 };
   const shieldedConfig = {
     networkId: config.networkId,
     indexerClientConnection: {
@@ -452,19 +528,31 @@ export const initWalletWithSeed = async (
   };
 
   const unifiedConfig = { ...shieldedConfig, ...unshieldedConfig, ...dustConfig };
+  // Sync progress survives restarts: when a snapshot exists, each wallet
+  // is rebuilt with restore() instead of rescanning from genesis.
+  const snapshot = snapshotPath ? readWalletSnapshot(snapshotPath) : null;
+  if (snapshot) {
+    logger.info(`Restoring wallet state from snapshot (${snapshot.savedAt})`);
+  }
   const facade = await WalletFacade.init({
     configuration: unifiedConfig,
     shielded: () =>
-      ShieldedWallet(shieldedConfig).startWithSecretKeys(shieldedSecretKeys),
+      snapshot
+        ? ShieldedWallet(shieldedConfig).restore(snapshot.shielded)
+        : ShieldedWallet(shieldedConfig).startWithSecretKeys(shieldedSecretKeys),
     unshielded: () =>
-      UnshieldedWallet(unshieldedConfig).startWithPublicKey(
-        UnshieldedPublicKey.fromKeyStore(unshieldedKeystore),
-      ),
+      snapshot
+        ? UnshieldedWallet(unshieldedConfig).restore(snapshot.unshielded)
+        : UnshieldedWallet(unshieldedConfig).startWithPublicKey(
+            UnshieldedPublicKey.fromKeyStore(unshieldedKeystore),
+          ),
     dust: () =>
-      DustWallet(dustConfig).startWithSecretKey(
-        dustSecretKey,
-        ledger.LedgerParameters.initialParameters().dust,
-      ),
+      snapshot
+        ? DustWallet(dustConfig).restore(snapshot.dust)
+        : DustWallet(dustConfig).startWithSecretKey(
+            dustSecretKey,
+            ledger.LedgerParameters.initialParameters().dust,
+          ),
   });
   await facade.start(shieldedSecretKeys, dustSecretKey);
 
@@ -474,10 +562,12 @@ export const initWalletWithSeed = async (
 export const buildWalletAndWaitForFunds = async (
   config: Config,
   mnemonic: string,
+  snapshotPath?: string,
 ): Promise<WalletContext> => {
   logger.info("Building wallet from mnemonic...");
   const seed = await mnemonicToSeed(mnemonic);
-  const walletContext = await initWalletWithSeed(seed, config);
+  const walletContext = await initWalletWithSeed(seed, config, snapshotPath);
+  if (snapshotPath) startSnapshotLoop(walletContext.wallet, snapshotPath);
   logger.info(
     `Your wallet address: ${walletContext.unshieldedKeystore.getBech32Address().asString()}`,
   );

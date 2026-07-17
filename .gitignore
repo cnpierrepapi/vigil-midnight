@@ -12,3 +12,4 @@ chain/midnight-level-db/
 .DS_Store
 
 .vercel
+chain/wallet-snapshot.json*

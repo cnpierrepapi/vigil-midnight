@@ -60,6 +60,14 @@ function shortHash(hex: string): string {
   return `0x${hex.slice(0, 10)}…${hex.slice(-6)}`;
 }
 
+// The live chain table distinguishes "genuinely all zeros on chain" from
+// the sim table's "(unset)": a fresh contract really does hold 32 zero
+// bytes in every commitment field.
+function chainHash(hex: string): string {
+  if (!hex || hex === ZERO64) return "0x00…00 (all zeros on chain)";
+  return `0x${hex.slice(0, 10)}…${hex.slice(-6)}`;
+}
+
 function fmtSeconds(total: number): string {
   const s = Math.max(0, total);
   const m = Math.floor(s / 60);
@@ -70,6 +78,48 @@ function fmtSeconds(total: number): string {
 const STORE_JOURNAL = "vigil.journal";
 const STORE_OWNER = "vigil.ownerSecrets";
 const STORE_HEIR = "vigil.heirSecret";
+
+// ---------- Lace wallet (Midnight DApp connector) ----------
+// Shapes follow the official leaderboard browser-dapp tutorial: wallets
+// register under window.midnight keyed by name, expose apiVersion (4.x),
+// connect(networkId) resolves to an API with getShieldedAddresses() and
+// getConfiguration().
+
+type ConnectorInitialAPI = {
+  apiVersion: string;
+  connect: (networkId: string) => Promise<ConnectorConnectedAPI>;
+};
+
+type ConnectorConnectedAPI = {
+  getShieldedAddresses: () => Promise<readonly string[]>;
+  getConfiguration: () => Promise<{ proverServerUri?: string }>;
+};
+
+type WalletConn =
+  | { status: "detecting" }
+  | { status: "no-wallet" }
+  | { status: "ready"; name: string }
+  | { status: "connecting" }
+  | { status: "connected"; name: string; address: string; proverServerUri?: string }
+  | { status: "error"; message: string };
+
+function findConnectorWallet(): { name: string; api: ConnectorInitialAPI } | null {
+  const midnight = (window as unknown as { midnight?: Record<string, unknown> })
+    .midnight;
+  if (!midnight) return null;
+  for (const [name, candidate] of Object.entries(midnight)) {
+    if (
+      candidate &&
+      typeof candidate === "object" &&
+      "apiVersion" in candidate &&
+      typeof (candidate as ConnectorInitialAPI).connect === "function" &&
+      String((candidate as ConnectorInitialAPI).apiVersion).startsWith("4")
+    ) {
+      return { name, api: candidate as ConnectorInitialAPI };
+    }
+  }
+  return null;
+}
 
 // ---------- page ----------
 
@@ -91,6 +141,50 @@ export default function VaultPage() {
   // live on-chain state of the deployed preprod contract (read-only)
   const [chain, setChain] = useState<ChainLedgerResponse | null>(null);
   const [chainBusy, setChainBusy] = useState(false);
+
+  // Lace wallet connection (Midnight DApp connector)
+  const [wallet, setWallet] = useState<WalletConn>({ status: "detecting" });
+
+  useEffect(() => {
+    let tries = 0;
+    const timer = setInterval(() => {
+      const found = findConnectorWallet();
+      if (found) {
+        clearInterval(timer);
+        setWallet({ status: "ready", name: found.name });
+      } else if (++tries >= 30) {
+        clearInterval(timer);
+        setWallet({ status: "no-wallet" });
+      }
+    }, 100);
+    return () => clearInterval(timer);
+  }, []);
+
+  const connectWallet = useCallback(async () => {
+    const found = findConnectorWallet();
+    if (!found) {
+      setWallet({ status: "no-wallet" });
+      return;
+    }
+    setWallet({ status: "connecting" });
+    try {
+      const api = await found.api.connect("preprod");
+      const [address] = await api.getShieldedAddresses();
+      const config = await api.getConfiguration();
+      setWallet({
+        status: "connected",
+        name: found.name,
+        address: address ?? "(no address)",
+        proverServerUri: config.proverServerUri,
+      });
+    } catch (e) {
+      setWallet({
+        status: "error",
+        message:
+          e instanceof Error ? e.message : "Wallet declined the connection",
+      });
+    }
+  }, []);
 
   const refreshChain = useCallback(async () => {
     setChainBusy(true);
@@ -333,6 +427,51 @@ export default function VaultPage() {
             Set up on Docker
           </Link>
         </div>
+      </div>
+
+      <div className="wallet-strip">
+        {wallet.status === "detecting" && (
+          <span className="wallet-note">Looking for a Midnight wallet…</span>
+        )}
+        {wallet.status === "no-wallet" && (
+          <span className="wallet-note">
+            No Midnight wallet detected.{" "}
+            <a
+              href="https://chromewebstore.google.com/detail/lace/gafhhkghbfjjkeiendhlofajokpaflmk"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Install Lace
+            </a>{" "}
+            to connect.
+          </span>
+        )}
+        {(wallet.status === "ready" || wallet.status === "error") && (
+          <>
+            <button className="cta ghost small" onClick={connectWallet}>
+              Connect Lace
+            </button>
+            {wallet.status === "error" && (
+              <span className="wallet-note">{wallet.message}</span>
+            )}
+          </>
+        )}
+        {wallet.status === "connecting" && (
+          <span className="wallet-note">Waiting for wallet approval…</span>
+        )}
+        {wallet.status === "connected" && (
+          <span className="wallet-note">
+            <strong>{wallet.name}</strong> connected:{" "}
+            <code className="inline" title={wallet.address}>
+              {wallet.address.length > 24
+                ? `${wallet.address.slice(0, 14)}…${wallet.address.slice(-8)}`
+                : wallet.address}
+            </code>
+            {wallet.proverServerUri
+              ? " · proving locally via your own proof server"
+              : ""}
+          </span>
+        )}
       </div>
 
       <div className="tabs">
@@ -606,7 +745,10 @@ export default function VaultPage() {
               disabled={chainBusy}
             >
               {chainBusy ? "Reading chain…" : "Refresh"}
-            </button>
+            </button>{" "}
+            <Link href="/records" className="cta ghost small">
+              Full on-chain record
+            </Link>
           </p>
           <table>
             <tbody>
@@ -617,19 +759,19 @@ export default function VaultPage() {
               <tr>
                 <td className="k">ownerCommit</td>
                 <td className="v" title={chain.ledger.ownerCommit}>
-                  {shortHash(chain.ledger.ownerCommit)}
+                  {chainHash(chain.ledger.ownerCommit)}
                 </td>
               </tr>
               <tr>
                 <td className="k">heirCommit</td>
                 <td className="v" title={chain.ledger.heirCommit}>
-                  {shortHash(chain.ledger.heirCommit)}
+                  {chainHash(chain.ledger.heirCommit)}
                 </td>
               </tr>
               <tr>
                 <td className="k">balanceCommit</td>
                 <td className="v" title={chain.ledger.balanceCommit}>
-                  {shortHash(chain.ledger.balanceCommit)}
+                  {chainHash(chain.ledger.balanceCommit)}
                 </td>
               </tr>
               <tr>
@@ -659,7 +801,7 @@ export default function VaultPage() {
               <tr>
                 <td className="k">claimReceipt</td>
                 <td className="v" title={chain.ledger.claimReceipt}>
-                  {shortHash(chain.ledger.claimReceipt)}
+                  {chainHash(chain.ledger.claimReceipt)}
                 </td>
               </tr>
             </tbody>

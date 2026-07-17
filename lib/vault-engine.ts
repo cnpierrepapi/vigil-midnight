@@ -306,6 +306,14 @@ function hexToBytesVar(hex: string): Uint8Array {
   return bytes;
 }
 
+// Decodes one hex-encoded on-chain contract state into the wire ledger.
+// Used by the records route, which fetches the state after every action.
+export async function decodeLedgerHex(stateHex: string): Promise<WireLedger> {
+  const env = await load();
+  const contractState = env.rt.ContractState.deserialize(hexToBytesVar(stateHex));
+  return serializeLedger(env.mod, env.mod.ledger(contractState.data));
+}
+
 export async function fetchChainLedger(): Promise<ChainLedgerResponse> {
   const contractAddress = process.env.VIGIL_CONTRACT_ADDRESS ?? null;
   const fetchedAt = Math.floor(Date.now() / 1000);

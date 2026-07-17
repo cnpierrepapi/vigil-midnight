@@ -62,7 +62,12 @@ if (!mnemonic) {
 }
 
 // 2. build wallet, wait for faucet funds, register dust
-const walletContext = await api.buildWalletAndWaitForFunds(config, mnemonic);
+// (snapshot file lets an interrupted first sync resume instead of rescanning)
+const walletContext = await api.buildWalletAndWaitForFunds(
+  config,
+  mnemonic,
+  path.join(chainDir, "wallet-snapshot.json"),
+);
 
 try {
   // 3. providers

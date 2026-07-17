@@ -83,7 +83,11 @@ const showLedger = (l: Vigil.Ledger | null) => {
   logger.info(`claimReceipt: ${toHex(l.claimReceipt)}`);
 };
 
-const walletContext = await api.buildWalletAndWaitForFunds(config, mnemonic);
+const walletContext = await api.buildWalletAndWaitForFunds(
+  config,
+  mnemonic,
+  path.join(chainDir, "wallet-snapshot.json"),
+);
 try {
   const providers = await api.configureProviders(walletContext, config);
 
@@ -104,7 +108,10 @@ try {
     switch (cmd) {
       case "arm": {
         const windowSeconds = BigInt(argA ?? "90");
-        const note = argB ?? "the key to the estate";
+        // npm's arg forwarding on Windows strips quotes, so the note is
+        // everything after the window, rejoined
+        const note =
+          process.argv.slice(4).join(" ") || "the key to the estate";
         const heirCommitment = Vigil.pureCircuits.heirPk(
           fromHex(secrets.heirSecret),
         );

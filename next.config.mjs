@@ -7,12 +7,14 @@ const nextConfig = {
   serverExternalPackages: [
     "@midnight-ntwrk/compact-runtime",
     "@midnight-ntwrk/onchain-runtime-v3",
+    "ws",
   ],
   outputFileTracingIncludes: {
     "/api/**": [
       "./contract/src/managed/vigil/contract/**",
       "./node_modules/@midnight-ntwrk/**",
       "./node_modules/object-inspect/**",
+      "./node_modules/ws/**",
     ],
   },
 };
