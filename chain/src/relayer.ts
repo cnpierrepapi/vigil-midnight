@@ -1,15 +1,24 @@
-// VIGIL live relayer. Holds the synced Preprod wallet and the vault owner's
-// private state, and submits real circuit calls when the public site asks
-// for them. This is what turns the hosted demo's buttons into on-chain
-// transactions: the browser talks to the Vercel proxy, the proxy talks to
-// this process, and this process proves and submits like the CLI does.
+// VIGIL live relayer. Holds the synced Preprod treasury wallet and submits
+// real circuit calls when the public site asks for them. Two families of
+// endpoints:
+//
+//   POST /vault/new   deploy + arm a FRESH vault contract for a visitor.
+//                     Secrets are generated in the visitor's browser and
+//                     sent here only to build the proofs; the treasury
+//                     wallet sponsors the dust fees.
+//   POST /vault/act   run one circuit (pulse / deposit / attest / claim)
+//                     against any vault, with the caller supplying the
+//                     private state. The relayer keeps nothing per user:
+//                     the browser owns the secrets and rolls its own
+//                     balance commitment forward after deposits.
+//   POST /act         legacy ops against the canonical house vault whose
+//                     secrets live in vault-secrets.json.
+//   GET  /health      liveness + queue depth.
 //
 //   npm run relayer -w vigil-chain
 //
-// Auth: every /act request must carry the shared token in x-vigil-token.
-// Only owner-side circuits are exposed (pulse, deposit, attest). claim is
-// terminal for the vault and stays operator-only; arm is one-shot and the
-// vault is already armed.
+// Auth: every POST must carry the shared token in x-vigil-token. Proofs
+// take ~40s each and run strictly serially (one proof server).
 
 import "dotenv/config";
 import fs from "node:fs";
@@ -22,7 +31,11 @@ import pinoPretty from "pino-pretty";
 
 import * as api from "./api";
 import { PreprodConfig } from "./config";
-import { createOwnerPrivateState } from "../../contract/src/witnesses";
+import {
+  createOwnerPrivateState,
+  createHeirPrivateState,
+  type VigilPrivateState,
+} from "../../contract/src/witnesses";
 import * as Vigil from "../../contract/src/managed/vigil/contract/index.js";
 
 const chainDir = path.resolve(
@@ -60,9 +73,13 @@ const deployment = JSON.parse(
 const secretsPath = path.join(chainDir, "vault-secrets.json");
 const secrets = JSON.parse(fs.readFileSync(secretsPath, "utf8"));
 
-// hard cap on visitor-supplied numbers; the circuit works in u64 space but
+// hard caps on visitor-supplied values; the circuit works in u64 space but
 // the demo has no business near it
 const MAX_AMOUNT = 1_000_000_000_000n;
+const MIN_WINDOW = 60n; // one minute
+const MAX_WINDOW = 2_592_000n; // thirty days
+const MAX_NOTE = 300;
+const HEX64 = /^[0-9a-f]{64}$/i;
 
 const wireLedger = (l: Vigil.Ledger | null) =>
   l === null
@@ -80,20 +97,30 @@ const wireLedger = (l: Vigil.Ledger | null) =>
         claimReceipt: toHex(l.claimReceipt),
       };
 
+const bad = (message: string) =>
+  Object.assign(new Error(message), { statusCode: 400 });
+
 const parseAmount = (raw: unknown, label: string): bigint => {
   if (typeof raw !== "string" && typeof raw !== "number") {
-    throw new Error(`${label} must be a number`);
+    throw bad(`${label} must be a number`);
   }
   const s = String(raw).trim();
-  if (!/^\d+$/.test(s)) throw new Error(`${label} must be a whole number`);
+  if (!/^\d+$/.test(s)) throw bad(`${label} must be a whole number`);
   const v = BigInt(s);
   if (v < 1n || v > MAX_AMOUNT) {
-    throw new Error(`${label} must be between 1 and ${MAX_AMOUNT}`);
+    throw bad(`${label} must be between 1 and ${MAX_AMOUNT}`);
   }
   return v;
 };
 
-// ---------- boot: wallet, providers, contract ----------
+const parseHex32 = (raw: unknown, label: string): Uint8Array => {
+  if (typeof raw !== "string" || !HEX64.test(raw)) {
+    throw bad(`${label} must be 64 hex characters`);
+  }
+  return fromHex(raw);
+};
+
+// ---------- boot: wallet, providers, house contract ----------
 
 logger.info("Relayer booting: restoring wallet from snapshot...");
 const config = new PreprodConfig();
@@ -106,86 +133,189 @@ const walletContext = await api.buildWalletAndWaitForFunds(
   path.join(chainDir, "wallet-snapshot.json"),
 );
 const providers = await api.configureProviders(walletContext, config);
-const contract = await api.joinContract(
-  providers,
-  deployment.contractAddress,
+
+const houseState = (): VigilPrivateState =>
   createOwnerPrivateState(
     fromHex(secrets.ownerSecretKey),
     BigInt(secrets.balance),
     fromHex(secrets.balanceSalt),
-  ),
+  );
+
+// The private state store is scoped by contract address. House and visitor
+// vaults share one provider, so every job pins the scope AND the state it
+// needs before calling a circuit; the serial queue makes this safe.
+const useVault = async (address: string, state: VigilPrivateState) => {
+  providers.privateStateProvider.setContractAddress(address);
+  await providers.privateStateProvider.set(api.VigilPrivateStateId, state);
+};
+
+const houseContract = await api.joinContract(
+  providers,
+  deployment.contractAddress,
+  houseState(),
 );
-providers.privateStateProvider.setContractAddress(deployment.contractAddress);
 
 let ready = true;
 logger.info(
-  `Relayer ready: vault ${deployment.contractAddress} on ${config.networkId}, port ${PORT}`,
+  `Relayer ready: house vault ${deployment.contractAddress} on ${config.networkId}, port ${PORT}`,
 );
 
-// ---------- serial op queue ----------
-// Proofs take ~40s each and the proof server handles one at a time, so ops
-// run strictly in sequence. The cap keeps a burst of visitors from queueing
-// an hour of work.
+// ---------- ops ----------
 
-let queued = 0;
-let chainTail: Promise<unknown> = Promise.resolve();
-const MAX_QUEUE = 3;
+type OpResult = Record<string, unknown>;
 
-type OpResult = {
-  op: string;
-  txId: string;
-  blockHeight: number;
-  ledger: ReturnType<typeof wireLedger>;
+const ledgerFor = async (address: string) =>
+  wireLedger(await api.getVigilLedgerState(providers, address));
+
+// deploy + arm a fresh vault for a visitor (two proofs, ~90s)
+const runNewVault = async (body: Record<string, unknown>): Promise<OpResult> => {
+  const ownerSecretKey = parseHex32(body.ownerSecretKey, "ownerSecretKey");
+  const heirSecret = parseHex32(body.heirSecret, "heirSecret");
+  const balanceSalt = parseHex32(body.balanceSalt, "balanceSalt");
+  const balance = parseAmount(body.balance, "balance");
+  const windowSeconds = parseAmount(body.window, "window");
+  if (windowSeconds < MIN_WINDOW || windowSeconds > MAX_WINDOW) {
+    throw bad(`window must be between ${MIN_WINDOW} and ${MAX_WINDOW} seconds`);
+  }
+  const note =
+    typeof body.note === "string" && body.note.trim().length > 0
+      ? body.note.slice(0, MAX_NOTE)
+      : "the key to the estate";
+
+  const ownerState = createOwnerPrivateState(
+    ownerSecretKey,
+    balance,
+    balanceSalt,
+  );
+  const contract = await api.deploy(providers, ownerState);
+  const pub = contract.deployTxData.public as unknown as {
+    contractAddress: string;
+    txId: string;
+    blockHeight: number;
+  };
+  logger.info(`Visitor vault deployed at ${pub.contractAddress}`);
+
+  const heirCommitment = Vigil.pureCircuits.heirPk(heirSecret);
+  const armTx = await api.arm(
+    contract,
+    heirCommitment,
+    windowSeconds,
+    now(),
+    note,
+  );
+
+  return {
+    contractAddress: pub.contractAddress,
+    deployTxId: pub.txId,
+    deployBlock: pub.blockHeight,
+    armTxId: armTx.txId,
+    armBlock: armTx.blockHeight,
+    ledger: await ledgerFor(pub.contractAddress),
+  };
 };
 
-const runOp = async (body: Record<string, unknown>): Promise<OpResult> => {
+// one circuit call against a visitor's vault, private state supplied by
+// the caller
+const runUserAct = async (body: Record<string, unknown>): Promise<OpResult> => {
+  const address = String(body.contractAddress ?? "");
+  if (!HEX64.test(address)) throw bad("contractAddress must be 64 hex characters");
   const op = String(body.op ?? "");
+
+  let state: VigilPrivateState;
+  if (op === "claim") {
+    state = createHeirPrivateState(parseHex32(body.heirSecret, "heirSecret"));
+  } else {
+    state = createOwnerPrivateState(
+      parseHex32(body.ownerSecretKey, "ownerSecretKey"),
+      parseAmount(body.balance, "balance"),
+      parseHex32(body.balanceSalt, "balanceSalt"),
+    );
+  }
+
+  await useVault(address, state);
+  const contract = await api.joinContract(providers, address, state);
+
+  let tx;
+  let note: string | undefined;
+  switch (op) {
+    case "pulse":
+      tx = await api.keepVigil(contract, now());
+      break;
+    case "deposit": {
+      const amount = parseAmount(body.amount, "amount");
+      const newSalt = parseHex32(body.newSalt, "newSalt");
+      tx = await api.deposit(contract, amount, newSalt);
+      break;
+    }
+    case "attest":
+      tx = await api.proveFunded(contract, parseAmount(body.threshold, "threshold"));
+      break;
+    case "claim": {
+      const res = await api.claim(contract);
+      tx = res.tx;
+      note = res.note;
+      break;
+    }
+    default:
+      throw bad(`Unknown op '${op}'. Use: pulse | deposit | attest | claim`);
+  }
+
+  return {
+    op,
+    txId: tx.txId,
+    blockHeight: tx.blockHeight,
+    ...(note !== undefined ? { note } : {}),
+    ledger: await ledgerFor(address),
+  };
+};
+
+// legacy ops against the canonical house vault
+const runHouseAct = async (body: Record<string, unknown>): Promise<OpResult> => {
+  const op = String(body.op ?? "");
+  await useVault(deployment.contractAddress, houseState());
   let tx;
   switch (op) {
     case "pulse": {
-      tx = await api.keepVigil(contract, now());
+      tx = await api.keepVigil(houseContract, now());
       break;
     }
     case "deposit": {
       const amount = parseAmount(body.amount, "amount");
       const newSalt = randomBytes32();
-      tx = await api.deposit(contract, amount, newSalt);
+      tx = await api.deposit(houseContract, amount, newSalt);
       // the witness does not roll private state forward; persist the new
       // balance + salt or the next proof would open a stale commitment
       secrets.balance = (BigInt(secrets.balance) + amount).toString();
       secrets.balanceSalt = toHex(newSalt);
       fs.writeFileSync(secretsPath, JSON.stringify(secrets, null, 2));
-      await providers.privateStateProvider.set(
-        api.VigilPrivateStateId,
-        createOwnerPrivateState(
-          fromHex(secrets.ownerSecretKey),
-          BigInt(secrets.balance),
-          fromHex(secrets.balanceSalt),
-        ),
-      );
+      await useVault(deployment.contractAddress, houseState());
       break;
     }
     case "attest": {
-      const threshold = parseAmount(body.threshold, "threshold");
-      tx = await api.proveFunded(contract, threshold);
+      tx = await api.proveFunded(houseContract, parseAmount(body.threshold, "threshold"));
       break;
     }
     default:
-      throw new Error(`Unknown op '${op}'. Use: pulse | deposit | attest`);
+      throw bad(`Unknown op '${op}'. Use: pulse | deposit | attest`);
   }
-  const ledger = await api.getVigilLedgerState(
-    providers,
-    deployment.contractAddress,
-  );
   return {
     op,
     txId: tx.txId,
     blockHeight: tx.blockHeight,
-    ledger: wireLedger(ledger),
+    ledger: await ledgerFor(deployment.contractAddress),
   };
 };
 
-const enqueue = (body: Record<string, unknown>): Promise<OpResult> => {
+// ---------- serial op queue ----------
+// One proof server, ~40s per proof (a new vault is two proofs), so ops run
+// strictly in sequence. The cap keeps a burst of visitors from queueing an
+// hour of work.
+
+let queued = 0;
+let chainTail: Promise<unknown> = Promise.resolve();
+const MAX_QUEUE = 3;
+
+const enqueue = (job: () => Promise<OpResult>): Promise<OpResult> => {
   if (queued >= MAX_QUEUE) {
     throw Object.assign(
       new Error(
@@ -195,10 +325,7 @@ const enqueue = (body: Record<string, unknown>): Promise<OpResult> => {
     );
   }
   queued += 1;
-  const result = chainTail.then(
-    () => runOp(body),
-    () => runOp(body),
-  );
+  const result = chainTail.then(job, job);
   chainTail = result.finally(() => {
     queued -= 1;
   });
@@ -212,8 +339,8 @@ const readBody = (req: http.IncomingMessage): Promise<string> =>
     let data = "";
     req.on("data", (chunk) => {
       data += chunk;
-      if (data.length > 4096) {
-        reject(new Error("Body too large"));
+      if (data.length > 8192) {
+        reject(bad("Body too large"));
         req.destroy();
       }
     });
@@ -246,7 +373,7 @@ const server = http.createServer(async (req, res) => {
       });
       return;
     }
-    if (req.method === "POST" && req.url === "/act") {
+    if (req.method === "POST") {
       if (req.headers["x-vigil-token"] !== TOKEN) {
         respond(res, 401, { ok: false, error: "Bad token" });
         return;
@@ -262,7 +389,17 @@ const server = http.createServer(async (req, res) => {
         respond(res, 400, { ok: false, error: "Invalid JSON body" });
         return;
       }
-      const result = await enqueue(body);
+      let result: OpResult;
+      if (req.url === "/vault/new") {
+        result = await enqueue(() => runNewVault(body));
+      } else if (req.url === "/vault/act") {
+        result = await enqueue(() => runUserAct(body));
+      } else if (req.url === "/act") {
+        result = await enqueue(() => runHouseAct(body));
+      } else {
+        respond(res, 404, { ok: false, error: "Not found" });
+        return;
+      }
       respond(res, 200, { ok: true, ...result });
       return;
     }
@@ -279,8 +416,8 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-// proofs hold requests open for ~40-60s; give them room
-server.requestTimeout = 240_000;
+// a new vault holds its request open for two proofs; give it room
+server.requestTimeout = 300_000;
 server.headersTimeout = 30_000;
 
 server.listen(PORT, () => {

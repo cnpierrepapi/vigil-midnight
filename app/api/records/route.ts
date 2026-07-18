@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { WebSocket } from "ws";
 import { decodeLedgerHex, type WireLedger } from "@/lib/vault-engine";
 
@@ -124,8 +124,18 @@ function collectHistory(address: string): Promise<RawAction[]> {
   });
 }
 
-export async function GET() {
-  const contractAddress = process.env.VIGIL_CONTRACT_ADDRESS ?? null;
+const HEX64 = /^[0-9a-fA-F]{64}$/;
+
+export async function GET(req: NextRequest) {
+  const override = req.nextUrl.searchParams.get("address");
+  if (override && !HEX64.test(override)) {
+    return NextResponse.json(
+      { ok: false, error: "Malformed contract address", records: [] },
+      { status: 400 },
+    );
+  }
+  const contractAddress =
+    override ?? process.env.VIGIL_CONTRACT_ADDRESS ?? null;
   if (!contractAddress) {
     return NextResponse.json(
       { ok: false, error: "VIGIL_CONTRACT_ADDRESS is not configured", records: [] },

@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 
 export const dynamic = "force-dynamic";
-// real proof generation on the relayer takes ~40-60s per circuit call
-export const maxDuration = 120;
+// a new vault is two real proofs (~90s) and may queue behind other
+// visitors; hold the line open accordingly
+export const maxDuration = 300;
 
-const ALLOWED_OPS = new Set(["pulse", "deposit", "attest"]);
+const ALLOWED_OPS = new Set(["new", "pulse", "deposit", "attest", "claim"]);
 
 export async function POST(req: NextRequest) {
   const relayerUrl = process.env.RELAYER_URL;
@@ -20,7 +21,7 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  let body: { op?: string; amount?: string; threshold?: string };
+  let body: Record<string, unknown>;
   try {
     body = await req.json();
   } catch {
@@ -29,26 +30,31 @@ export async function POST(req: NextRequest) {
       { status: 400 },
     );
   }
-  if (!body.op || !ALLOWED_OPS.has(body.op)) {
+  const op = typeof body.op === "string" ? body.op : "";
+  if (!ALLOWED_OPS.has(op)) {
     return NextResponse.json(
       { ok: false, error: "Unknown op" },
       { status: 400 },
     );
   }
 
+  const base = relayerUrl.replace(/\/$/, "");
+  const endpoint =
+    op === "new"
+      ? `${base}/vault/new`
+      : typeof body.contractAddress === "string"
+        ? `${base}/vault/act`
+        : `${base}/act`;
+
   try {
-    const res = await fetch(`${relayerUrl.replace(/\/$/, "")}/act`, {
+    const res = await fetch(endpoint, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "x-vigil-token": relayerToken,
       },
-      body: JSON.stringify({
-        op: body.op,
-        amount: body.amount,
-        threshold: body.threshold,
-      }),
-      signal: AbortSignal.timeout(110_000),
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(280_000),
       cache: "no-store",
     });
     const data = await res.json();

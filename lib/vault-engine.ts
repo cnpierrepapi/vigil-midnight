@@ -314,8 +314,11 @@ export async function decodeLedgerHex(stateHex: string): Promise<WireLedger> {
   return serializeLedger(env.mod, env.mod.ledger(contractState.data));
 }
 
-export async function fetchChainLedger(): Promise<ChainLedgerResponse> {
-  const contractAddress = process.env.VIGIL_CONTRACT_ADDRESS ?? null;
+export async function fetchChainLedger(
+  addressOverride?: string,
+): Promise<ChainLedgerResponse> {
+  const contractAddress =
+    addressOverride ?? process.env.VIGIL_CONTRACT_ADDRESS ?? null;
   const fetchedAt = Math.floor(Date.now() / 1000);
   const fail = (error: string): ChainLedgerResponse => ({
     ok: false,

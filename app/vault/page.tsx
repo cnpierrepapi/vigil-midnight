@@ -3,14 +3,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 
-// ---------- wire types (mirrors lib/vault-engine.ts) ----------
-
-type WireSecrets = {
-  ownerSecretKey: string;
-  heirSecret: string;
-  balance: string;
-  balanceSalt: string;
-};
+// ---------- wire types (mirror lib/vault-engine.ts + relayer) ----------
 
 type WireLedger = {
   state: "UNARMED" | "ARMED" | "CLAIMED";
@@ -25,15 +18,6 @@ type WireLedger = {
   claimReceipt: string;
 };
 
-type VaultResponse = {
-  ok: boolean;
-  error?: string;
-  journal: unknown[];
-  ledger: WireLedger | null;
-  result?: string;
-  serverTime: number;
-};
-
 type ChainLedgerResponse = {
   ok: boolean;
   error?: string;
@@ -43,9 +27,23 @@ type ChainLedgerResponse = {
   fetchedAt: number;
 };
 
+// Everything needed to drive one vault. Secrets are generated in this
+// browser and stored only here; the relayer sees them per request to build
+// proofs, and the chain only ever sees commitments.
+type MyVault = {
+  contractAddress: string;
+  ownerSecretKey: string;
+  heirSecret: string;
+  balance: string;
+  balanceSalt: string;
+  deployTxId?: string;
+  armTxId?: string;
+};
+
 // ---------- helpers ----------
 
 const ZERO64 = "0".repeat(64);
+const STORE_VAULT = "vigil.myVault.v1";
 
 function randomHex32(): string {
   const bytes = new Uint8Array(32);
@@ -56,13 +54,10 @@ function randomHex32(): string {
 }
 
 function shortHash(hex: string): string {
-  if (!hex || hex === ZERO64) return "(unset)";
+  if (!hex) return "";
   return `0x${hex.slice(0, 10)}…${hex.slice(-6)}`;
 }
 
-// The live chain table distinguishes "genuinely all zeros on chain" from
-// the sim table's "(unset)": a fresh contract really does hold 32 zero
-// bytes in every commitment field.
 function chainHash(hex: string): string {
   if (!hex || hex === ZERO64) return "0x00…00 (all zeros on chain)";
   return `0x${hex.slice(0, 10)}…${hex.slice(-6)}`;
@@ -74,10 +69,6 @@ function fmtSeconds(total: number): string {
   const r = s % 60;
   return `${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`;
 }
-
-const STORE_JOURNAL = "vigil.journal";
-const STORE_OWNER = "vigil.ownerSecrets";
-const STORE_HEIR = "vigil.heirSecret";
 
 // ---------- Lace wallet (Midnight DApp connector) ----------
 // Shapes follow the official leaderboard browser-dapp tutorial: wallets
@@ -131,22 +122,23 @@ function findConnectorWallet(): { name: string; api: ConnectorInitialAPI } | nul
 
 export default function VaultPage() {
   const [tab, setTab] = useState<"owner" | "heir">("owner");
-  const [journal, setJournal] = useState<unknown[]>([]);
+  const [vault, setVault] = useState<MyVault | null>(null);
   const [led, setLed] = useState<WireLedger | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
   const [flash, setFlash] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+  const [lastTx, setLastTx] = useState<{ label: string; txId: string; blockHeight: number } | null>(null);
   const [claimedNote, setClaimedNote] = useState<string | null>(null);
   const [now, setNow] = useState(() => Math.floor(Date.now() / 1000));
   const clockOffset = useRef(0);
   const hydrated = useRef(false);
 
-  // owner secrets live only in this browser
-  const [ownerSecrets, setOwnerSecrets] = useState<WireSecrets | null>(null);
-  const [heirSecret, setHeirSecret] = useState<string>("");
-
-  // live on-chain state of the deployed preprod contract (read-only)
-  const [chain, setChain] = useState<ChainLedgerResponse | null>(null);
-  const [chainBusy, setChainBusy] = useState(false);
+  // form state
+  const [windowSec, setWindowSec] = useState("600");
+  const [initialBalance, setInitialBalance] = useState("100000");
+  const [note, setNote] = useState("the key to the estate");
+  const [depositAmount, setDepositAmount] = useState("250");
+  const [threshold, setThreshold] = useState("50000");
+  const [heirInput, setHeirInput] = useState("");
 
   // Lace wallet connection (Midnight DApp connector)
   const [wallet, setWallet] = useState<WalletConn>({ status: "detecting" });
@@ -174,7 +166,7 @@ export default function VaultPage() {
     }
     setWallet({ status: "connecting" });
     try {
-      // VIGIL's vault lives on preprod, but current Lace builds only speak
+      // VIGIL's vaults live on preprod, but current Lace builds only speak
       // the preview testnet for Midnight; fall back to the wallet's own
       // network so the connection succeeds, and label it honestly.
       let network = "preprod";
@@ -198,96 +190,41 @@ export default function VaultPage() {
       });
     } catch (e) {
       const raw = e instanceof Error ? e.message : "Wallet declined the connection";
-      // "Remote API ... was shutdown" is the Lace extension's background
-      // worker going idle mid-handshake, not a DApp-side failure
       let message = raw;
       // "Remote API ... was shutdown" is the Lace extension's background
       // worker going idle mid-handshake, not a DApp-side failure
       if (/shutdown|no longer be used/i.test(raw)) {
         message =
           "Lace's background process was asleep. Open the Lace extension, unlock it, then press Connect again.";
-      } else if (/network id mismatch/i.test(raw)) {
-        // VIGIL lives on the preprod testnet; Lace ships pointed at the
-        // preview testnet by default
-        message =
-          "Your wallet is on a different Midnight network (addresses starting mn_addr_preview belong to the Preview testnet). VIGIL is deployed on Preprod: in Lace, open Settings, choose Network, select Pre-production, then press Connect again.";
       }
       setWallet({ status: "error", message });
     }
   }, []);
 
-  const refreshChain = useCallback(async () => {
-    setChainBusy(true);
+  // ---------- chain state polling ----------
+
+  const refreshChain = useCallback(async (address: string) => {
     try {
-      const res = await fetch("/api/chain", { cache: "no-store" });
-      setChain((await res.json()) as ChainLedgerResponse);
+      const res = await fetch(`/api/chain?address=${address}`, {
+        cache: "no-store",
+      });
+      const data = (await res.json()) as ChainLedgerResponse;
+      if (data.ok && data.ledger) {
+        setLed(data.ledger);
+        clockOffset.current = data.fetchedAt - Math.floor(Date.now() / 1000);
+        setNow(data.fetchedAt);
+      }
     } catch {
-      setChain(null);
-    } finally {
-      setChainBusy(false);
+      // transient network failure; the next poll retries
     }
   }, []);
 
-  // live on-chain actions, submitted through the relayer that holds the
-  // demo vault's owner key
-  const [liveBusy, setLiveBusy] = useState<string | null>(null);
-  const [liveMsg, setLiveMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
-  const [liveTx, setLiveTx] = useState<{ op: string; txId: string; blockHeight: number } | null>(null);
-  const [liveDeposit, setLiveDeposit] = useState("250");
-  const [liveThreshold, setLiveThreshold] = useState("50000");
-
-  const liveAct = useCallback(
-    async (op: string, extra: Record<string, string> = {}) => {
-      setLiveBusy(op);
-      setLiveMsg(null);
-      setLiveTx(null);
-      try {
-        const res = await fetch("/api/live", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ op, ...extra }),
-        });
-        const data = await res.json();
-        if (data.ok) {
-          setLiveTx({ op, txId: data.txId, blockHeight: data.blockHeight });
-          if (data.ledger) {
-            setChain((prev) =>
-              prev ? { ...prev, ledger: data.ledger as WireLedger } : prev,
-            );
-          }
-          setLiveMsg({
-            kind: "ok",
-            text: `Settled on Preprod in block ${Number(data.blockHeight).toLocaleString()}.`,
-          });
-        } else {
-          setLiveMsg({
-            kind: "err",
-            text: data.error ?? "The relayer refused the request.",
-          });
-        }
-      } catch (e) {
-        setLiveMsg({
-          kind: "err",
-          text: e instanceof Error ? e.message : String(e),
-        });
-      } finally {
-        setLiveBusy(null);
-      }
-    },
-    [],
-  );
-
   useEffect(() => {
-    refreshChain();
-  }, [refreshChain]);
-
-  // form state
-  const [windowSec, setWindowSec] = useState("90");
-  const [initialBalance, setInitialBalance] = useState("100000");
-  const [note, setNote] = useState("the key to the estate");
-  const [depositAmount, setDepositAmount] = useState("50000");
-  const [threshold, setThreshold] = useState("50000");
-  const [heirInput, setHeirInput] = useState("");
+    if (!vault) return;
+    refreshChain(vault.contractAddress);
+    const t = setInterval(() => refreshChain(vault.contractAddress), 15_000);
+    return () => clearInterval(t);
+  }, [vault, refreshChain]);
 
   // 1s clock for the countdown
   useEffect(() => {
@@ -298,27 +235,74 @@ export default function VaultPage() {
     return () => clearInterval(t);
   }, []);
 
-  const post = useCallback(
-    async (action: Record<string, unknown>): Promise<VaultResponse | null> => {
-      setBusy(true);
+  // hydrate from localStorage once
+  useEffect(() => {
+    if (hydrated.current) return;
+    hydrated.current = true;
+    try {
+      const raw = localStorage.getItem(STORE_VAULT);
+      if (raw) {
+        const v = JSON.parse(raw) as MyVault;
+        setVault(v);
+        setHeirInput(v.heirSecret);
+      }
+    } catch {
+      // corrupted local state; start fresh
+    }
+  }, []);
+
+  const saveVault = (v: MyVault) => {
+    setVault(v);
+    localStorage.setItem(STORE_VAULT, JSON.stringify(v));
+  };
+
+  const forgetVault = () => {
+    localStorage.removeItem(STORE_VAULT);
+    setVault(null);
+    setLed(null);
+    setClaimedNote(null);
+    setFlash(null);
+    setLastTx(null);
+    setHeirInput("");
+  };
+
+  // ---------- relayer calls ----------
+
+  const relay = useCallback(
+    async (
+      op: string,
+      payload: Record<string, unknown>,
+      label: string,
+    ): Promise<Record<string, unknown> | null> => {
+      setBusy(op);
       setFlash(null);
+      setLastTx(null);
       try {
-        const res = await fetch("/api/vault", {
+        const res = await fetch("/api/live", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ journal, action }),
+          body: JSON.stringify({ op, ...payload }),
         });
-        const data: VaultResponse = await res.json();
-        clockOffset.current = data.serverTime - Math.floor(Date.now() / 1000);
-        setNow(data.serverTime);
-        if (data.ledger) setLed(data.ledger);
+        const data = (await res.json()) as Record<string, unknown>;
         if (data.ok) {
-          setJournal(data.journal);
-          localStorage.setItem(STORE_JOURNAL, JSON.stringify(data.journal));
-        } else if (data.error) {
-          setFlash({ kind: "err", text: data.error });
+          if (data.ledger) setLed(data.ledger as WireLedger);
+          if (typeof data.txId === "string") {
+            setLastTx({
+              label,
+              txId: data.txId,
+              blockHeight: Number(data.blockHeight),
+            });
+          }
+          return data;
         }
-        return data;
+        setFlash({
+          kind: "err",
+          text:
+            typeof data.error === "string"
+              ? data.error
+              : "The relayer refused the request.",
+        });
+        return null;
       } catch (e) {
         setFlash({
           kind: "err",
@@ -326,136 +310,116 @@ export default function VaultPage() {
         });
         return null;
       } finally {
-        setBusy(false);
+        setBusy(null);
       }
     },
-    [journal],
+    [],
   );
 
-  // hydrate from localStorage once
-  useEffect(() => {
-    if (hydrated.current) return;
-    hydrated.current = true;
-    try {
-      const j = localStorage.getItem(STORE_JOURNAL);
-      const o = localStorage.getItem(STORE_OWNER);
-      const h = localStorage.getItem(STORE_HEIR);
-      if (o) setOwnerSecrets(JSON.parse(o));
-      if (h) {
-        setHeirSecret(h);
-        setHeirInput(h);
-      }
-      if (j) {
-        const parsed = JSON.parse(j) as unknown[];
-        setJournal(parsed);
-        // replay on the server to rebuild the ledger view
-        fetch("/api/vault", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ journal: parsed, action: { kind: "inspect" } }),
-        })
-          .then((r) => r.json())
-          .then((data: VaultResponse) => {
-            clockOffset.current =
-              data.serverTime - Math.floor(Date.now() / 1000);
-            if (data.ledger) setLed(data.ledger);
-          })
-          .catch(() => undefined);
-      }
-    } catch {
-      // corrupted local state; start fresh
-    }
-  }, []);
+  // ---------- actions (every one settles on Midnight Preprod) ----------
 
-  const resetDemo = () => {
-    localStorage.removeItem(STORE_JOURNAL);
-    localStorage.removeItem(STORE_OWNER);
-    localStorage.removeItem(STORE_HEIR);
-    setJournal([]);
-    setLed(null);
-    setOwnerSecrets(null);
-    setHeirSecret("");
-    setHeirInput("");
-    setClaimedNote(null);
-    setFlash(null);
-  };
-
-  // ---------- actions ----------
-
-  const arm = async () => {
-    const secrets: WireSecrets = {
+  const createVault = async () => {
+    const fresh = {
       ownerSecretKey: randomHex32(),
       heirSecret: randomHex32(),
-      balance: initialBalance,
       balanceSalt: randomHex32(),
     };
-    const r = await post({
-      kind: "arm",
-      window: Number(windowSec),
-      note,
-      secrets,
-    });
-    if (r?.ok) {
-      const ownerOnly = { ...secrets, heirSecret: ZERO64 };
-      setOwnerSecrets(ownerOnly);
-      setHeirSecret(secrets.heirSecret);
-      setHeirInput(secrets.heirSecret);
-      localStorage.setItem(STORE_OWNER, JSON.stringify(ownerOnly));
-      localStorage.setItem(STORE_HEIR, secrets.heirSecret);
-      setFlash({ kind: "ok", text: "The vault is armed. The vigil begins." });
+    const data = await relay(
+      "new",
+      {
+        window: windowSec.trim(),
+        note,
+        balance: initialBalance.trim(),
+        ...fresh,
+      },
+      "arm",
+    );
+    if (data && typeof data.contractAddress === "string") {
+      saveVault({
+        contractAddress: data.contractAddress,
+        ownerSecretKey: fresh.ownerSecretKey,
+        heirSecret: fresh.heirSecret,
+        balance: initialBalance.trim(),
+        balanceSalt: fresh.balanceSalt,
+        deployTxId: typeof data.deployTxId === "string" ? data.deployTxId : undefined,
+        armTxId: typeof data.armTxId === "string" ? data.armTxId : undefined,
+      });
+      setHeirInput(fresh.heirSecret);
+      setLastTx({
+        label: "arm",
+        txId: String(data.armTxId ?? ""),
+        blockHeight: Number(data.armBlock ?? 0),
+      });
+      setFlash({
+        kind: "ok",
+        text: "Your vault is live on Midnight Preprod. The vigil begins.",
+      });
     }
   };
 
+  const ownerPayload = () =>
+    vault
+      ? {
+          contractAddress: vault.contractAddress,
+          ownerSecretKey: vault.ownerSecretKey,
+          balance: vault.balance,
+          balanceSalt: vault.balanceSalt,
+        }
+      : {};
+
   const pulse = async () => {
-    if (!ownerSecrets) return;
-    const r = await post({ kind: "keepVigil", secrets: ownerSecrets });
-    if (r?.ok) setFlash({ kind: "ok", text: "Pulse recorded. The vigil holds." });
+    if (!vault) return;
+    const r = await relay("pulse", ownerPayload(), "keepVigil");
+    if (r) setFlash({ kind: "ok", text: "Pulse settled on chain. The vigil holds." });
   };
 
   const deposit = async () => {
-    if (!ownerSecrets) return;
+    if (!vault) return;
     const newSalt = randomHex32();
-    const r = await post({
-      kind: "deposit",
-      amount: depositAmount,
-      newSalt,
-      secrets: ownerSecrets,
-    });
-    if (r?.ok) {
-      const updated: WireSecrets = {
-        ...ownerSecrets,
+    const r = await relay(
+      "deposit",
+      { ...ownerPayload(), amount: depositAmount.trim(), newSalt },
+      "deposit",
+    );
+    if (r) {
+      // roll the local private state forward to match the new commitment
+      saveVault({
+        ...vault,
         balance: (
-          BigInt(ownerSecrets.balance) + BigInt(depositAmount)
+          BigInt(vault.balance) + BigInt(depositAmount.trim())
         ).toString(),
         balanceSalt: newSalt,
-      };
-      setOwnerSecrets(updated);
-      localStorage.setItem(STORE_OWNER, JSON.stringify(updated));
+      });
       setFlash({
         kind: "ok",
-        text: "Deposit sealed. The commitment rolled forward; the amount stays private.",
+        text: "Deposit sealed on chain. The commitment rolled forward; the amount stays private.",
       });
     }
   };
 
   const attest = async () => {
-    if (!ownerSecrets) return;
-    const r = await post({
-      kind: "proveFunded",
-      threshold,
-      secrets: ownerSecrets,
-    });
-    if (r?.ok)
+    if (!vault) return;
+    const r = await relay(
+      "attest",
+      { ...ownerPayload(), threshold: threshold.trim() },
+      "proveFunded",
+    );
+    if (r)
       setFlash({
         kind: "ok",
-        text: `Attested: the vault holds at least ${Number(threshold).toLocaleString()}. The balance itself stays private.`,
+        text: `Attested on chain: the vault holds at least ${Number(threshold).toLocaleString()}. The balance itself stays private.`,
       });
   };
 
   const claim = async () => {
-    const r = await post({ kind: "claim", heirSecret: heirInput.trim() });
-    if (r?.ok && r.result !== undefined) {
-      setClaimedNote(r.result);
+    if (!vault) return;
+    const r = await relay(
+      "claim",
+      { contractAddress: vault.contractAddress, heirSecret: heirInput.trim() },
+      "claim",
+    );
+    if (r) {
+      if (typeof r.note === "string") setClaimedNote(r.note);
       setFlash({ kind: "ok", text: "The claim proof passed. The estate is yours." });
     }
   };
@@ -467,6 +431,14 @@ export default function VaultPage() {
   const lapseAt = led ? Number(led.lastPulse) + Number(led.vigilWindow) : 0;
   const remaining = lapseAt - now;
   const lapsed = armed && remaining < 0;
+
+  const busyText: Record<string, string> = {
+    new: "Deploying your vault contract, then sealing it with arm. Two real ZK proofs, about 90 seconds. The chain does not hurry.",
+    pulse: "Proving you hold the owner key. About 40 seconds.",
+    deposit: "Rolling the balance commitment forward on chain. About 40 seconds.",
+    attest: "Proving the balance clears the floor without revealing it. About 40 seconds.",
+    claim: "Proving the vigil lapsed and you hold the heir secret. About 40 seconds.",
+  };
 
   return (
     <main className="shell">
@@ -487,13 +459,13 @@ export default function VaultPage() {
 
       <div className="demo-banner">
         <p>
-          <strong>Two vaults on this page.</strong> The consoles below run
-          your own private sandbox vault: real compiled VIGIL circuits, but
-          settlement is simulated so you can arm, lapse, and claim in
-          minutes. The <strong>Live on Midnight Preprod</strong> panel at the
-          bottom drives the canonical vault with real on-chain transactions.
-          In production the proof server runs on your own machine and your
-          secrets never leave it.
+          <strong>Everything here is on chain.</strong> Your vault is a real
+          contract deployed to Midnight Preprod; every button generates a
+          real ZK proof (about 40 seconds) and settles in a block. Secrets
+          are generated in this browser and sent only to the VIGIL relayer
+          to build proofs; fees are sponsored by the VIGIL treasury wallet,
+          so you never need a faucet. The chain itself sees commitments and
+          nothing else.
         </p>
         <div className="cta-row">
           <a
@@ -505,7 +477,10 @@ export default function VaultPage() {
             README
           </a>
           <Link href="/" className="cta ghost small">
-            Set up on Docker
+            Run it yourself on Docker
+          </Link>
+          <Link href="/records" className="cta ghost small">
+            House vault record
           </Link>
         </div>
       </div>
@@ -549,10 +524,7 @@ export default function VaultPage() {
                 : wallet.address}
             </code>
             {wallet.network === "preview"
-              ? " · note: the live vault below runs on preprod, so this wallet observes but cannot transact with it"
-              : ""}
-            {wallet.proverServerUri
-              ? " · proving locally via your own proof server"
+              ? " · note: your vault runs on preprod, so this wallet observes but does not sign here"
               : ""}
           </span>
         )}
@@ -571,26 +543,45 @@ export default function VaultPage() {
         >
           Heir view
         </button>
-        <button className="tab reset" onClick={resetDemo}>
-          Reset demo
-        </button>
+        {vault && (
+          <button className="tab reset" onClick={forgetVault}>
+            Forget this vault
+          </button>
+        )}
       </div>
 
-      {flash && (
+      {busy && <div className="flash ok">{busyText[busy] ?? "Proving…"}</div>}
+      {flash && !busy && (
         <div className={flash.kind === "ok" ? "flash ok" : "flash err"}>
           {flash.text}
         </div>
+      )}
+      {lastTx && !busy && (
+        <p className="note">
+          {lastTx.label}: transaction{" "}
+          <code className="inline selectable" title={lastTx.txId}>
+            {shortHash(lastTx.txId)}
+          </code>{" "}
+          in block {lastTx.blockHeight.toLocaleString()} ·{" "}
+          {vault && (
+            <Link href={`/records?address=${vault.contractAddress}`}>
+              see your vault&apos;s on-chain record
+            </Link>
+          )}
+        </p>
       )}
 
       {tab === "owner" && (
         <section className="panel wide">
           <span className="badge owner">Owner console</span>
 
-          {!led || led.state === "UNARMED" ? (
+          {!vault ? (
             <div className="form">
               <p className="lead">
-                Arm the vault: your identity, your heir&apos;s identity, and
-                the balance all go on chain as commitments. Nothing readable.
+                Begin your vigil: VIGIL deploys a fresh vault contract to
+                Midnight Preprod just for you, then arms it. Your identity,
+                your heir&apos;s identity, and the balance go on chain as
+                commitments. Nothing readable.
               </p>
               <label>
                 Vigil window (seconds)
@@ -612,43 +603,69 @@ export default function VaultPage() {
                 Legacy note (released only to the heir)
                 <input value={note} onChange={(e) => setNote(e.target.value)} />
               </label>
-              <button className="cta primary" onClick={arm} disabled={busy}>
-                {busy ? "Sealing…" : "Arm the vault"}
+              <button
+                className="cta primary"
+                onClick={createVault}
+                disabled={busy !== null}
+              >
+                {busy === "new"
+                  ? "Deploying on Preprod…"
+                  : "Deploy and arm my vault"}
               </button>
+              <p className="hint">
+                Two on-chain transactions: deploy, then arm. Expect about 90
+                seconds while the proofs are generated.
+              </p>
             </div>
           ) : claimed ? (
             <div className="memorial">
               <p>
                 The vigil has ended. The estate passed to the heir, whose
-                claim receipt is now the only trace:
+                claim receipt is now the only trace on chain:
               </p>
-              <code className="inline">{shortHash(led.claimReceipt)}</code>
+              <code className="inline">{led ? shortHash(led.claimReceipt) : ""}</code>
+              <p className="hint">
+                This vault is closed forever; the contract accepts no further
+                proofs. Forget it above and begin a new vigil whenever you
+                like.
+              </p>
             </div>
           ) : (
             <div className="armed">
+              <p className="note">
+                Your vault contract:{" "}
+                <code className="inline selectable" title={vault.contractAddress}>
+                  {vault.contractAddress}
+                </code>{" "}
+                ·{" "}
+                <Link href={`/records?address=${vault.contractAddress}`}>
+                  on-chain record
+                </Link>
+              </p>
               <div className="countdown">
                 <span className="cd-label">
                   {lapsed ? "The vigil has lapsed" : "Vigil lapses in"}
                 </span>
                 <span className={lapsed ? "cd-time danger" : "cd-time"}>
-                  {lapsed ? "the heir may claim" : fmtSeconds(remaining)}
+                  {led
+                    ? lapsed
+                      ? "the heir may claim"
+                      : fmtSeconds(remaining)
+                    : "reading chain…"}
                 </span>
               </div>
               <button
                 className="pulse-btn"
                 onClick={pulse}
-                disabled={busy || !ownerSecrets}
-                title={
-                  ownerSecrets
-                    ? "Prove you hold the owner key; reveal nothing else"
-                    : "This browser does not hold the owner key"
-                }
+                disabled={busy !== null}
+                title="Prove you hold the owner key; reveal nothing else"
               >
-                {busy ? "Proving…" : "Keep Vigil"}
+                {busy === "pulse" ? "Proving…" : "Keep Vigil"}
               </button>
               <p className="hint">
-                Each pulse proves knowledge of the owner key and resets the
-                clock. The chain sees a counter tick. Nothing else.
+                Each pulse proves knowledge of the owner key on chain and
+                resets the clock. The chain sees a counter tick. Nothing
+                else.
               </p>
 
               <div className="ops">
@@ -662,9 +679,9 @@ export default function VaultPage() {
                   <button
                     className="cta ghost"
                     onClick={deposit}
-                    disabled={busy || !ownerSecrets}
+                    disabled={busy !== null}
                   >
-                    Roll commitment forward
+                    {busy === "deposit" ? "Proving…" : "Roll commitment forward"}
                   </button>
                 </div>
                 <div className="op">
@@ -677,19 +694,17 @@ export default function VaultPage() {
                   <button
                     className="cta ghost"
                     onClick={attest}
-                    disabled={busy || !ownerSecrets}
+                    disabled={busy !== null}
                   >
-                    Attest publicly
+                    {busy === "attest" ? "Proving…" : "Attest publicly"}
                   </button>
                 </div>
               </div>
 
-              {heirSecret && (
-                <div className="secret-box">
-                  <h3>Heir secret (hand this to your heir, off-chain)</h3>
-                  <code className="inline selectable">{heirSecret}</code>
-                </div>
-              )}
+              <div className="secret-box">
+                <h3>Heir secret (hand this to your heir, off-chain)</h3>
+                <code className="inline selectable">{vault.heirSecret}</code>
+              </div>
             </div>
           )}
         </section>
@@ -704,22 +719,31 @@ export default function VaultPage() {
               <blockquote className="note-reveal">{claimedNote}</blockquote>
               {led && (
                 <p className="hint">
-                  Claim receipt on chain: <code className="inline">{shortHash(led.claimReceipt)}</code>
+                  Claim receipt on chain:{" "}
+                  <code className="inline">{shortHash(led.claimReceipt)}</code>
                 </p>
               )}
+            </div>
+          ) : !vault ? (
+            <div className="form">
+              <p className="lead">
+                No vault in this browser yet. The owner deploys and arms the
+                vault, then hands the heir secret over off-chain. Come back
+                with that secret when the vigil lapses.
+              </p>
             </div>
           ) : (
             <div className="form">
               <p className="lead">
                 Until claim day you are a stranger to this chain: the ledger
-                below is everything you can see. When the vigil lapses, prove
-                knowledge of your secret and claim.
+                below is everything you can see. When the vigil lapses,
+                prove knowledge of your secret and claim, on chain.
               </p>
               {armed && (
                 <p className="hint">
                   {lapsed
                     ? "The vigil has lapsed. The claim window is open."
-                    : `The vigil holds for another ${fmtSeconds(remaining)}. A claim now will be rejected by the protocol; try it.`}
+                    : `The vigil holds for another ${fmtSeconds(remaining)}. A claim now will be rejected by the contract itself; try it.`}
                 </p>
               )}
               <label>
@@ -734,237 +758,84 @@ export default function VaultPage() {
               <button
                 className="cta primary"
                 onClick={claim}
-                disabled={busy || heirInput.trim().length !== 64}
+                disabled={busy !== null || heirInput.trim().length !== 64}
               >
-                {busy ? "Proving…" : "Claim the estate"}
+                {busy === "claim" ? "Proving…" : "Claim the estate"}
               </button>
             </div>
           )}
         </section>
       )}
 
-      <section className="ledger">
-        <h2>What the chain sees (sandbox vault)</h2>
-        <p className="note">
-          The complete public state of your sandbox vault. Every identity
-          and amount is a commitment; this is all a stranger, an exchange,
-          or a court ever sees.
-        </p>
-        <table>
-          <tbody>
-            <tr>
-              <td className="k">state</td>
-              <td className="v">{led ? led.state : "UNARMED (no vault yet)"}</td>
-            </tr>
-            <tr>
-              <td className="k">ownerCommit</td>
-              <td className="v" title={led?.ownerCommit ?? ""}>
-                {led ? shortHash(led.ownerCommit) : "(unset)"}
-              </td>
-            </tr>
-            <tr>
-              <td className="k">heirCommit</td>
-              <td className="v" title={led?.heirCommit ?? ""}>
-                {led ? shortHash(led.heirCommit) : "(unset)"}
-              </td>
-            </tr>
-            <tr>
-              <td className="k">balanceCommit</td>
-              <td className="v" title={led?.balanceCommit ?? ""}>
-                {led ? shortHash(led.balanceCommit) : "(unset)"}
-              </td>
-            </tr>
-            <tr>
-              <td className="k">lastPulse</td>
-              <td className="v">{led?.lastPulse ?? "0"}</td>
-            </tr>
-            <tr>
-              <td className="k">vigilWindow</td>
-              <td className="v">{led?.vigilWindow ?? "0"}</td>
-            </tr>
-            <tr>
-              <td className="k">pulses</td>
-              <td className="v">{led?.pulses ?? "0"}</td>
-            </tr>
-            <tr>
-              <td className="k">attestedFloor</td>
-              <td className="v">
-                {led && led.attestedFloor !== "0"
-                  ? `${Number(led.attestedFloor).toLocaleString()} (the only number the owner chose to reveal)`
-                  : "0 (nothing attested)"}
-              </td>
-            </tr>
-            <tr>
-              <td className="k">legacyNote</td>
-              <td className="v">
-                {led?.legacyNotePresent
-                  ? "opaque blob (present, unreadable)"
-                  : "(none)"}
-              </td>
-            </tr>
-            <tr>
-              <td className="k">claimReceipt</td>
-              <td className="v" title={led?.claimReceipt ?? ""}>
-                {led ? shortHash(led.claimReceipt) : "(unset)"}
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </section>
-
-      {chain && chain.ok && chain.ledger && (
+      {vault && (
         <section className="ledger">
-          <h2>Live on Midnight Preprod</h2>
+          <h2>What the chain sees</h2>
           <p className="note">
-            The same contract, deployed for real. This is the public ledger
-            of VIGIL at{" "}
-            <code className="inline" title={chain.contractAddress ?? ""}>
-              {shortHash(chain.contractAddress ?? "")}
+            The complete public state of your vault at{" "}
+            <code className="inline" title={vault.contractAddress}>
+              {shortHash(vault.contractAddress)}
             </code>{" "}
-            on the Midnight Preprod testnet, read from the network indexer
-            and deserialized through the contract runtime.{" "}
-            <button
-              className="cta ghost small"
-              onClick={refreshChain}
-              disabled={chainBusy}
-            >
-              {chainBusy ? "Reading chain…" : "Refresh"}
-            </button>{" "}
-            <Link href="/records" className="cta ghost small">
-              Full on-chain record
-            </Link>
+            on Midnight Preprod, read from the network indexer and
+            deserialized through the contract runtime. Every identity and
+            amount is a commitment; this is all a stranger, an exchange, or
+            a court ever sees.
           </p>
-
-          <div className="live-actions">
-            <p className="note">
-              These three buttons are not a simulation. Each press asks the
-              relayer holding this vault&apos;s owner key to generate a real
-              ZK proof and submit a real transaction to Midnight Preprod.
-              Expect about 40 seconds per press; the receipt lands in the
-              record page for anyone to verify.
-            </p>
-            <div className="ops">
-              <div className="op">
-                <h3>Keep vigil on chain</h3>
-                <p className="hint">
-                  Prove the owner key, reset the clock, tick the counter.
-                </p>
-                <button
-                  className="cta primary"
-                  onClick={() => liveAct("pulse")}
-                  disabled={liveBusy !== null}
-                >
-                  {liveBusy === "pulse" ? "Proving…" : "Pulse the real vault"}
-                </button>
-              </div>
-              <div className="op">
-                <h3>Deposit (private)</h3>
-                <input
-                  value={liveDeposit}
-                  onChange={(e) => setLiveDeposit(e.target.value)}
-                  inputMode="numeric"
-                />
-                <button
-                  className="cta ghost"
-                  onClick={() => liveAct("deposit", { amount: liveDeposit.trim() })}
-                  disabled={liveBusy !== null}
-                >
-                  {liveBusy === "deposit" ? "Proving…" : "Roll commitment on chain"}
-                </button>
-              </div>
-              <div className="op">
-                <h3>Prove funded &ge; threshold</h3>
-                <input
-                  value={liveThreshold}
-                  onChange={(e) => setLiveThreshold(e.target.value)}
-                  inputMode="numeric"
-                />
-                <button
-                  className="cta ghost"
-                  onClick={() =>
-                    liveAct("attest", { threshold: liveThreshold.trim() })
-                  }
-                  disabled={liveBusy !== null}
-                >
-                  {liveBusy === "attest" ? "Proving…" : "Attest on chain"}
-                </button>
-              </div>
-            </div>
-            {liveBusy && (
-              <p className="note">
-                Generating the zero-knowledge proof and waiting for the block.
-                This genuinely takes about 40 seconds; the proof server is
-                doing real work.
-              </p>
-            )}
-            {liveMsg && (
-              <div className={liveMsg.kind === "ok" ? "flash ok" : "flash err"}>
-                {liveMsg.text}
-              </div>
-            )}
-            {liveTx && (
-              <p className="note">
-                Transaction{" "}
-                <code className="inline selectable" title={liveTx.txId}>
-                  {liveTx.txId}
-                </code>{" "}
-                · <Link href="/records">see it in the vault record</Link>
-              </p>
-            )}
-          </div>
-
           <table>
             <tbody>
               <tr>
                 <td className="k">state</td>
-                <td className="v">{chain.ledger.state}</td>
+                <td className="v">{led ? led.state : "reading chain…"}</td>
               </tr>
               <tr>
                 <td className="k">ownerCommit</td>
-                <td className="v" title={chain.ledger.ownerCommit}>
-                  {chainHash(chain.ledger.ownerCommit)}
+                <td className="v" title={led?.ownerCommit ?? ""}>
+                  {led ? chainHash(led.ownerCommit) : "…"}
                 </td>
               </tr>
               <tr>
                 <td className="k">heirCommit</td>
-                <td className="v" title={chain.ledger.heirCommit}>
-                  {chainHash(chain.ledger.heirCommit)}
+                <td className="v" title={led?.heirCommit ?? ""}>
+                  {led ? chainHash(led.heirCommit) : "…"}
                 </td>
               </tr>
               <tr>
                 <td className="k">balanceCommit</td>
-                <td className="v" title={chain.ledger.balanceCommit}>
-                  {chainHash(chain.ledger.balanceCommit)}
+                <td className="v" title={led?.balanceCommit ?? ""}>
+                  {led ? chainHash(led.balanceCommit) : "…"}
                 </td>
               </tr>
               <tr>
                 <td className="k">lastPulse</td>
-                <td className="v">{chain.ledger.lastPulse}</td>
+                <td className="v">{led?.lastPulse ?? "…"}</td>
               </tr>
               <tr>
                 <td className="k">vigilWindow</td>
-                <td className="v">{chain.ledger.vigilWindow}</td>
+                <td className="v">{led?.vigilWindow ?? "…"}</td>
               </tr>
               <tr>
                 <td className="k">pulses</td>
-                <td className="v">{chain.ledger.pulses}</td>
+                <td className="v">{led?.pulses ?? "…"}</td>
               </tr>
               <tr>
                 <td className="k">attestedFloor</td>
-                <td className="v">{chain.ledger.attestedFloor}</td>
+                <td className="v">
+                  {led && led.attestedFloor !== "0"
+                    ? `${Number(led.attestedFloor).toLocaleString()} (the only number the owner chose to reveal)`
+                    : "0 (nothing attested)"}
+                </td>
               </tr>
               <tr>
                 <td className="k">legacyNote</td>
                 <td className="v">
-                  {chain.ledger.legacyNotePresent
+                  {led?.legacyNotePresent
                     ? "opaque blob (present, unreadable)"
                     : "(none)"}
                 </td>
               </tr>
               <tr>
                 <td className="k">claimReceipt</td>
-                <td className="v" title={chain.ledger.claimReceipt}>
-                  {chainHash(chain.ledger.claimReceipt)}
+                <td className="v" title={led?.claimReceipt ?? ""}>
+                  {led ? chainHash(led.claimReceipt) : "…"}
                 </td>
               </tr>
             </tbody>
@@ -973,10 +844,10 @@ export default function VaultPage() {
       )}
 
       <footer className="footer">
-        Every action on this page executes a real compiled Compact circuit
-        (arm, keepVigil, deposit, proveFunded, claim) through the Midnight
-        contract runtime. Assertions you see on failure are the
-        contract&apos;s own.
+        Every action on this page is a real transaction on Midnight Preprod,
+        proved by the compiled VIGIL circuits (arm, keepVigil, deposit,
+        proveFunded, claim). Assertions you see on failure are the
+        contract&apos;s own, enforced by the protocol.
       </footer>
     </main>
   );

@@ -1,7 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { useSearchParams } from "next/navigation";
+import { Suspense, useCallback, useEffect, useState } from "react";
 
 type WireLedger = {
   state: "UNARMED" | "ARMED" | "CLAIMED";
@@ -55,14 +56,19 @@ function ledgerSummary(l: WireLedger): string {
   return bits.join(" · ");
 }
 
-export default function RecordsPage() {
+function RecordsView() {
+  const params = useSearchParams();
+  const address = params.get("address");
   const [data, setData] = useState<RecordsResponse | null>(null);
   const [busy, setBusy] = useState(true);
 
   const refresh = useCallback(async () => {
     setBusy(true);
     try {
-      const res = await fetch("/api/records", { cache: "no-store" });
+      const url = address
+        ? `/api/records?address=${address}`
+        : "/api/records";
+      const res = await fetch(url, { cache: "no-store" });
       setData((await res.json()) as RecordsResponse);
     } catch (e) {
       setData({
@@ -73,7 +79,7 @@ export default function RecordsPage() {
     } finally {
       setBusy(false);
     }
-  }, []);
+  }, [address]);
 
   useEffect(() => {
     refresh();
@@ -109,7 +115,7 @@ export default function RecordsPage() {
         <h2>Vault provenance</h2>
         {data?.contractAddress && (
           <p className="note">
-            Contract{" "}
+            {address ? "Your vault contract" : "The house vault contract"}{" "}
             <code className="inline selectable">{data.contractAddress}</code>{" "}
             on Midnight Preprod, history streamed from the network indexer.
             Each row shows the transaction and the public ledger state it
@@ -164,5 +170,13 @@ export default function RecordsPage() {
         contract runtime; nothing on this page is simulated.
       </footer>
     </main>
+  );
+}
+
+export default function RecordsPage() {
+  return (
+    <Suspense>
+      <RecordsView />
+    </Suspense>
   );
 }
