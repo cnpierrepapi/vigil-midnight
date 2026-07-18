@@ -617,3 +617,25 @@ code.inline.selectable {
   font-style: italic;
   color: var(--text);
 }
+
+.live-actions {
+  border: 1px solid var(--flame-soft);
+  border-left: 3px solid var(--flame);
+  border-radius: 8px;
+  padding: 16px;
+  margin: 14px 0 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.live-actions .ops {
+  grid-template-columns: 1fr 1fr 1fr;
+  max-width: none;
+}
+
+@media (max-width: 700px) {
+  .live-actions .ops {
+    grid-template-columns: 1fr;
+  }
+}

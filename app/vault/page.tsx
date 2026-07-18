@@ -228,6 +228,55 @@ export default function VaultPage() {
     }
   }, []);
 
+  // live on-chain actions, submitted through the relayer that holds the
+  // demo vault's owner key
+  const [liveBusy, setLiveBusy] = useState<string | null>(null);
+  const [liveMsg, setLiveMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+  const [liveTx, setLiveTx] = useState<{ op: string; txId: string; blockHeight: number } | null>(null);
+  const [liveDeposit, setLiveDeposit] = useState("250");
+  const [liveThreshold, setLiveThreshold] = useState("50000");
+
+  const liveAct = useCallback(
+    async (op: string, extra: Record<string, string> = {}) => {
+      setLiveBusy(op);
+      setLiveMsg(null);
+      setLiveTx(null);
+      try {
+        const res = await fetch("/api/live", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ op, ...extra }),
+        });
+        const data = await res.json();
+        if (data.ok) {
+          setLiveTx({ op, txId: data.txId, blockHeight: data.blockHeight });
+          if (data.ledger) {
+            setChain((prev) =>
+              prev ? { ...prev, ledger: data.ledger as WireLedger } : prev,
+            );
+          }
+          setLiveMsg({
+            kind: "ok",
+            text: `Settled on Preprod in block ${Number(data.blockHeight).toLocaleString()}.`,
+          });
+        } else {
+          setLiveMsg({
+            kind: "err",
+            text: data.error ?? "The relayer refused the request.",
+          });
+        }
+      } catch (e) {
+        setLiveMsg({
+          kind: "err",
+          text: e instanceof Error ? e.message : String(e),
+        });
+      } finally {
+        setLiveBusy(null);
+      }
+    },
+    [],
+  );
+
   useEffect(() => {
     refreshChain();
   }, [refreshChain]);
@@ -438,10 +487,12 @@ export default function VaultPage() {
 
       <div className="demo-banner">
         <p>
-          <strong>Demo topology.</strong> You skipped the local proof server,
-          so the real compiled VIGIL circuits execute on our server with
-          simulated chain settlement, and your demo secrets travel to it. In
-          production the proof server runs on your own machine and your
+          <strong>Two vaults on this page.</strong> The consoles below run
+          your own private sandbox vault: real compiled VIGIL circuits, but
+          settlement is simulated so you can arm, lapse, and claim in
+          minutes. The <strong>Live on Midnight Preprod</strong> panel at the
+          bottom drives the canonical vault with real on-chain transactions.
+          In production the proof server runs on your own machine and your
           secrets never leave it.
         </p>
         <div className="cta-row">
@@ -693,11 +744,11 @@ export default function VaultPage() {
       )}
 
       <section className="ledger">
-        <h2>What the chain sees</h2>
+        <h2>What the chain sees (sandbox vault)</h2>
         <p className="note">
-          The complete public state. Every identity and amount is a
-          commitment; this is all a stranger, an exchange, or a court ever
-          sees.
+          The complete public state of your sandbox vault. Every identity
+          and amount is a commitment; this is all a stranger, an exchange,
+          or a court ever sees.
         </p>
         <table>
           <tbody>
@@ -783,6 +834,85 @@ export default function VaultPage() {
               Full on-chain record
             </Link>
           </p>
+
+          <div className="live-actions">
+            <p className="note">
+              These three buttons are not a simulation. Each press asks the
+              relayer holding this vault&apos;s owner key to generate a real
+              ZK proof and submit a real transaction to Midnight Preprod.
+              Expect about 40 seconds per press; the receipt lands in the
+              record page for anyone to verify.
+            </p>
+            <div className="ops">
+              <div className="op">
+                <h3>Keep vigil on chain</h3>
+                <p className="hint">
+                  Prove the owner key, reset the clock, tick the counter.
+                </p>
+                <button
+                  className="cta primary"
+                  onClick={() => liveAct("pulse")}
+                  disabled={liveBusy !== null}
+                >
+                  {liveBusy === "pulse" ? "Proving…" : "Pulse the real vault"}
+                </button>
+              </div>
+              <div className="op">
+                <h3>Deposit (private)</h3>
+                <input
+                  value={liveDeposit}
+                  onChange={(e) => setLiveDeposit(e.target.value)}
+                  inputMode="numeric"
+                />
+                <button
+                  className="cta ghost"
+                  onClick={() => liveAct("deposit", { amount: liveDeposit.trim() })}
+                  disabled={liveBusy !== null}
+                >
+                  {liveBusy === "deposit" ? "Proving…" : "Roll commitment on chain"}
+                </button>
+              </div>
+              <div className="op">
+                <h3>Prove funded &ge; threshold</h3>
+                <input
+                  value={liveThreshold}
+                  onChange={(e) => setLiveThreshold(e.target.value)}
+                  inputMode="numeric"
+                />
+                <button
+                  className="cta ghost"
+                  onClick={() =>
+                    liveAct("attest", { threshold: liveThreshold.trim() })
+                  }
+                  disabled={liveBusy !== null}
+                >
+                  {liveBusy === "attest" ? "Proving…" : "Attest on chain"}
+                </button>
+              </div>
+            </div>
+            {liveBusy && (
+              <p className="note">
+                Generating the zero-knowledge proof and waiting for the block.
+                This genuinely takes about 40 seconds; the proof server is
+                doing real work.
+              </p>
+            )}
+            {liveMsg && (
+              <div className={liveMsg.kind === "ok" ? "flash ok" : "flash err"}>
+                {liveMsg.text}
+              </div>
+            )}
+            {liveTx && (
+              <p className="note">
+                Transaction{" "}
+                <code className="inline selectable" title={liveTx.txId}>
+                  {liveTx.txId}
+                </code>{" "}
+                · <Link href="/records">see it in the vault record</Link>
+              </p>
+            )}
+          </div>
+
           <table>
             <tbody>
               <tr>
